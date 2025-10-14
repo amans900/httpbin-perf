@@ -1,0 +1,35 @@
+{
+  "title": "Container Metrics (cAdvisor)",
+  "schemaVersion": 36,
+  "version": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "CPU (container)",
+      "targets": [
+        {
+          "expr": "rate(container_cpu_usage_seconds_total[1m])",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory (container)",
+      "targets": [
+        {
+          "expr": "container_memory_working_set_bytes",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ]
+    }
+  ]
+}

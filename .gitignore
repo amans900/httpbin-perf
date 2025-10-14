@@ -1,0 +1,8 @@
+# runtime / data
+influxdb/
+loki/data/
+grafana/data/
+jmeter/results/
+jenkins/jenkins_home/
+**/*.log
+.DS_Store

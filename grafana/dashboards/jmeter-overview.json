@@ -1,0 +1,49 @@
+{
+  "title": "JMeter Overview",
+  "schemaVersion": 36,
+  "version": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Requests per Second",
+      "targets": [
+        {
+          "query": "SELECT sum(\"count\") FROM \"jmeter\" WHERE (\"application\"='HTTPBIN') AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influxdb"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency (avg/p90/p95)",
+      "targets": [
+        {
+          "query": "SELECT mean(\"mean\") as avg FROM \"jmeter\" WHERE (\"application\"='HTTPBIN' AND \"statut\"='ok') AND $timeFilter GROUP BY time($__interval)",
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influxdb"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Error %",
+      "targets": [
+        {
+          "query": "SELECT 100 * (sum(\"count\") - sum(\"ok.count\")) / sum(\"count\") FROM \"jmeter\" WHERE (\"application\"='HTTPBIN') AND $timeFilter GROUP BY time($__interval)",
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influxdb"
+          }
+        }
+      ]
+    }
+  ]
+}

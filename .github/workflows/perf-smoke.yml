@@ -1,0 +1,28 @@
+name: perf-smoke
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  jmeter-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build JMeter image
+        run: docker build -t jmeter:5.6.3 ./jmeter/docker
+      - name: Start minimal infra
+        run: docker compose up -d influxdb httpbin
+      - name: Run smoke test
+        run: |
+          chmod +x scripts/run-smoke.sh
+          ./scripts/run-smoke.sh
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: jmeter-report
+          path: jmeter/results/smoke/html
+      - name: Stop
+        if: always()
+        run: docker compose down -v

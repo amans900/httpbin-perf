@@ -1,0 +1,15 @@
+image:
+  repository: kennethreitz/httpbin
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+
+jmeter:
+  enabled: true
+  image: jmeter:5.6.3
+  threads: 50
+  rampup: 30
+  duration: 120

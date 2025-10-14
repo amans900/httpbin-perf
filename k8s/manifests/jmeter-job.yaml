@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jmeter-run
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: jmeter
+          image: jmeter:5.6.3
+          args:
+            - "-n"
+            - "-t"
+            - "/jmeter/testplans/httpbin_load.jmx"
+            - "-Jtarget_host=httpbin"
+            - "-Jtarget_port=80"
+            - "-Jthreads=50"
+            - "-Jrampup=30"
+            - "-Jduration=120"
+          volumeMounts:
+            - name: tests
+              mountPath: /jmeter
+      volumes:
+        - name: tests
+          configMap:
+            name: jmeter-tests

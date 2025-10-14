@@ -1,0 +1,6 @@
+apiVersion: v2
+name: httpbin-perf
+description: Demo chart deploying httpbin and an on-demand JMeter Job
+type: application
+version: 0.1.0
+appVersion: "1.0"

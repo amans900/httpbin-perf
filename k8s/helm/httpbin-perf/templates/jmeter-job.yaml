@@ -1,0 +1,29 @@
+{{- if .Values.jmeter.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jmeter-run
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: jmeter
+          image: {{ .Values.jmeter.image }}
+          args:
+            - "-n"
+            - "-t"
+            - "/jmeter/testplans/httpbin_load.jmx"
+            - "-Jtarget_host=httpbin"
+            - "-Jtarget_port=80"
+            - "-Jthreads={{ .Values.jmeter.threads }}"
+            - "-Jrampup={{ .Values.jmeter.rampup }}"
+            - "-Jduration={{ .Values.jmeter.duration }}"
+          volumeMounts:
+            - name: tests
+              mountPath: /jmeter
+      volumes:
+        - name: tests
+          configMap:
+            name: jmeter-tests
+{{- end }}

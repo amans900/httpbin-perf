@@ -1,0 +1,42 @@
+pipeline {
+  agent any
+
+  options { timestamps() }
+
+  environment {
+    DOCKER_BUILDKIT = "1"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+    stage('Start infra') {
+      steps {
+        sh 'docker compose up -d influxdb loki promtail prometheus cadvisor grafana httpbin'
+      }
+    }
+    stage('Build JMeter image') {
+      steps {
+        sh 'docker build -t jmeter:5.6.3 ./jmeter/docker'
+      }
+    }
+    stage('Smoke test') {
+      steps {
+        sh 'chmod +x scripts/run-smoke.sh && ./scripts/run-smoke.sh'
+      }
+    }
+    stage('Archive report') {
+      steps {
+        archiveArtifacts artifacts: 'jmeter/results/smoke/html/**', fingerprint: true, onlyIfSuccessful: false
+      }
+    }
+  }
+  post {
+    always {
+      sh 'docker compose down -v'
+    }
+  }
+}
