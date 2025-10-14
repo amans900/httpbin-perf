@@ -1,0 +1,20 @@
+{
+  "title": "HTTPBin Perf Overview",
+  "panels": [
+    {
+      "type": "text",
+      "title": "Welcome",
+      "gridPos": {
+        "w": 24,
+        "h": 4,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "content": "Use this dashboard during perf runs to correlate metrics with load."
+      }
+    }
+  ],
+  "schemaVersion": 38,
+  "version": 1
+}
