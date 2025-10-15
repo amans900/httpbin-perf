@@ -40,14 +40,18 @@ jobs:
       - name: Start minimal infra (httpbin + monitoring)
         run: |
           set -eux
-          docker compose up -d influxdb httpbin grafana loki promtail prometheus cadvisor
-          sleep 15
-          docker ps
+          # assumes your docker-compose has grafana, renderer, prometheus, cadvisor, etc.
+          docker compose up -d influxdb httpbin grafana renderer loki promtail prometheus cadvisor
+          # give services time to come up
+          for i in {1..30}; do
+            docker ps
+            curl -fsS http://localhost:3000/api/health >/dev/null && break || sleep 2
+          done
 
       - name: Build JMeter image (5.6.3)
         run: docker build -t jmeter:5.6.3 ./jmeter/docker
 
-      # ---- Run test, write CSV (17 columns + header), and build dashboard in one go ----
+      # ---- Run test, write CSV JTL (17 columns + header), and build dashboard in one go ----
       - name: Run ${{ matrix.scenario }} (headless; CSV JTL; generate HTML)
         run: |
           set -eux
@@ -60,8 +64,7 @@ jobs:
           rm -f "$CSV_JTL" || true
           rm -rf "$OUT/html" || true
 
-          # Force the exact CSV layout the report generator expects (with header)
-          # and generate dashboard (-e -o) in the same JMeter process.
+          # Force the standard CSV layout the HTML report expects (17 columns + header).
           set +e
           docker run --rm --network host \
             -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
@@ -98,40 +101,11 @@ jobs:
           set -e
 
           echo "JMeter raw exit code (info only): $EXIT"
-          echo "CSV header (should be 17 columns):"
-          head -n 1 "$CSV_JTL" || true
+          echo "CSV header:"; head -n 1 "$CSV_JTL" || true
           test -f "$OUT/html/index.html" && echo "Dashboard generated." || echo "Dashboard missing."
+          ls -l "$ROOT" || true; ls -l "$OUT" || true
 
-          ls -l "$ROOT" || true
-          ls -l "$OUT" || true
-
-      - name: Upload artifacts (${{ matrix.scenario }})
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: jmeter-${{ matrix.scenario }}-artifacts
-          retention-days: 30
-          if-no-files-found: warn
-          path: |
-            jmeter/results/${{ matrix.scenario }}/html
-            jmeter/results/${{ matrix.scenario }}.csv
-            jmeter/results/${{ matrix.scenario }}/jmeter.log
-            jmeter/results/${{ matrix.scenario }}/grafana
-
-
-      # ---- Upload artifacts for each scenario ----
-      - name: Upload artifacts (${{ matrix.scenario }})
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: jmeter-${{ matrix.scenario }}-artifacts
-          retention-days: 30
-          if-no-files-found: warn
-          path: |
-            jmeter/results/${{ matrix.scenario }}/html
-            jmeter/results/${{ matrix.scenario }}.csv
-            jmeter/results/${{ matrix.scenario }}/jmeter.log
-
+      # ---- Render Grafana PNGs (AFTER the test), then upload one artifact per scenario ----
       - name: Render Grafana panels (${{ matrix.scenario }})
         if: always()
         run: |
@@ -142,47 +116,49 @@ jobs:
           RANGE=$((RAMP + DUR + 120))   # seconds back from now
           TO_ms=$(( $(date -u +%s) * 1000 ))
           FROM_ms=$(( $(date -u -d "-${RANGE} seconds" +%s) * 1000 ))
-
           OUT_DIR="jmeter/results/${SCEN}/grafana"
           mkdir -p "${OUT_DIR}"
 
-          # Wait for Grafana + renderer to be ready
-          for i in {1..30}; do
-            curl -fsS http://localhost:3000/api/health >/dev/null && break || sleep 2
-          done
+          # basic auth (from docker-compose env GF_SECURITY_ADMIN_USER/PASSWORD)
+          AUTH_FLAG="-u admin:admin"
 
-          # --- OPTION A: use admin/basic auth (set above in compose) ---
-          AUTH="admin:admin"
-          AUTH_FLAG="-u ${AUTH}"
-
-          # If you know your JMeter dashboard UID, put it here.
-          # If you provisioned from this repo, you can read it from the JSON file:
+          # Resolve JMeter dashboard UID (fallback if jq/file missing)
           JM_DASH_UID=$(jq -r '.uid // .dashboard.uid' grafana/dashboards/jmeter-overview.json 2>/dev/null || echo "jmeter-overview")
 
-          # Helper to render one panel by id into a file
-          render_panel () {
-            local panel_id="$1"
-            local outfile="$2"
-            curl -fsSL ${AUTH_FLAG} \
-              "http://localhost:3000/render/d-solo/${JM_DASH_UID}?orgId=1&panelId=${panel_id}&from=${FROM_ms}&to=${TO_ms}&width=1600&height=800&tz=UTC&theme=dark" \
-              -o "${outfile}"
-          }
-
-          # If you don't know your panel IDs, print them once:
-          echo "Listing available panels (id: title):"
+          echo "Available panels (id: title) for UID=${JM_DASH_UID}:"
           curl -fsSL ${AUTH_FLAG} "http://localhost:3000/api/dashboards/uid/${JM_DASH_UID}" \
             | jq -r '.dashboard.panels[] | "\(.id): \(.title)"' || true
 
-          # >>>> SET THESE to match your dashboard <<<<
+          # Panel IDs – adjust after first run if needed
           RPS_ID=${RPS_ID:-2}
           ERR_ID=${ERR_ID:-4}
           LAT_ID=${LAT_ID:-3}
 
-          render_panel "${RPS_ID}" "${OUT_DIR}/requests_per_second.png" || true
-          render_panel "${ERR_ID}" "${OUT_DIR}/error_percent.png"       || true
-          render_panel "${LAT_ID}" "${OUT_DIR}/latency.png"             || true
+          render() {
+            local id="$1" out="$2"
+            curl -fsSL ${AUTH_FLAG} \
+              "http://localhost:3000/render/d-solo/${JM_DASH_UID}?orgId=1&panelId=${id}&from=${FROM_ms}&to=${TO_ms}&width=1600&height=800&tz=UTC&theme=dark" \
+              -o "${out}" || true
+          }
 
+          render "${RPS_ID}" "${OUT_DIR}/requests_per_second.png"
+          render "${ERR_ID}" "${OUT_DIR}/error_percent.png"
+          render "${LAT_ID}" "${OUT_DIR}/latency.png"
           ls -l "${OUT_DIR}" || true
+
+      - name: Upload artifacts (${{ matrix.scenario }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # unique per scenario & run to avoid 409 conflicts on re-runs
+          name: jmeter-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            jmeter/results/${{ matrix.scenario }}/html
+            jmeter/results/${{ matrix.scenario }}.csv
+            jmeter/results/${{ matrix.scenario }}/jmeter.log
+            jmeter/results/${{ matrix.scenario }}/grafana
 
       - name: Stop stack
         if: always()
