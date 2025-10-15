@@ -21,7 +21,7 @@ jobs:
       # tweak loads here in the UI
       SMOKE_THREADS: "30"
       SMOKE_RAMPUP:  "10"
-      SMOKE_DURATION:"45"
+      SMOKE_DURATION: "45"
 
       LOAD_THREADS:  "120"
       LOAD_RAMPUP:   "60"
@@ -29,11 +29,11 @@ jobs:
 
       SPIKE_THREADS: "250"
       SPIKE_RAMPUP:  "10"
-      SPIKE_DURATION:"60"
+      SPIKE_DURATION: "60"
 
-      STRESS_THREADS:"400"
+      STRESS_THREADS: "400"
       STRESS_RAMPUP: "60"
-      STRESS_DURATION:"120"
+      STRESS_DURATION: "120"
 
       SOAK_THREADS:  "40"
       SOAK_RAMPUP:   "20"
