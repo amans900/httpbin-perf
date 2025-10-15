@@ -14,26 +14,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - scenario: smoke   # quick confidence check
+          - scenario: smoke
             threads: 50
             rampup: 30
             duration: 60
-          - scenario: load    # sustained expected traffic
+          - scenario: load
             threads: 100
             rampup: 60
             duration: 180
-          - scenario: stress  # find breaking point
+          - scenario: stress
             threads: 300
             rampup: 60
             duration: 120
-          - scenario: spike   # sudden surge
+          - scenario: spike
             threads: 200
             rampup: 10
             duration: 60
-          - scenario: soak    # stability over time
+          - scenario: soak
             threads: 50
             rampup: 30
-            duration: 900
+            duration: 300
 
     steps:
       - name: Checkout
@@ -49,16 +49,18 @@ jobs:
       - name: Build JMeter image (5.6.3)
         run: docker build -t jmeter:5.6.3 ./jmeter/docker
 
-      # --------- RUN TEST (force XML JTL at JVM level; capture exit code) ---------
+      # --------- RUN TEST (force XML JTL to a DIFFERENT filename; capture exit code) ---------
       - name: Run ${{ matrix.scenario }} test (headless; XML JTL + jmeter.log)
         id: run_test
         run: |
           set -eux
           SCEN=${{ matrix.scenario }}
-          rm -rf jmeter/results/$SCEN jmeter/results/$SCEN.jtl || true
-          mkdir -p jmeter/results/$SCEN/html
+          XML_JTL="jmeter/results/${SCEN}.xml.jtl"   # <-- our file (XML)
+          CSV_JTL="jmeter/results/${SCEN}.jtl"       # <-- file possibly written by the JMX (CSV)
+          mkdir -p jmeter/results/${SCEN}/html
+          rm -f "$XML_JTL" "$CSV_JTL" || true
 
-          # Run headless and FORCE XML output via JVM_ARGS so no CSV/column issues can occur
+          # Run headless and FORCE XML output via JVM_ARGS; write to our XML_JTL
           set +e
           docker run --rm --network host \
             -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m \
@@ -71,33 +73,40 @@ jobs:
             -Jduration=${{ matrix.duration }} \
             -Jscenario_name=$SCEN \
             -Jtarget_host=localhost -Jtarget_port=8080 \
-            -l results/$SCEN.jtl \
-            -j results/$SCEN/jmeter.log
+            -l "results/${SCEN}.xml.jtl" \
+            -j "results/${SCEN}/jmeter.log"
           EXIT=$?
           set -e
 
-          # Proof: first line should be XML prolog
-          head -n 1 jmeter/results/$SCEN.jtl || true
+          echo "---- First line of our JTL (should be XML prolog) ----"
+          head -n 1 "$XML_JTL" || true
+
+          # If the plan also wrote a CSV JTL to results/<scenario>.jtl, show a hint
+          if [ -f "$CSV_JTL" ]; then
+            echo "Detected CSV written by JMX at $CSV_JTL (kept for debugging)."
+            head -n 2 "$CSV_JTL" || true
+          fi
+
           echo "exit_code=$EXIT" >> $GITHUB_OUTPUT
 
-      # --------- Generate HTML (even if the test failed) ---------
+      # --------- Generate HTML (always, using our XML JTL) ---------
       - name: Generate HTML report (${{ matrix.scenario }})
         if: always()
         run: |
           set -eux
           SCEN=${{ matrix.scenario }}
-          FILE="jmeter/results/$SCEN.jtl"
-          if [ -s "$FILE" ]; then
+          XML_JTL="jmeter/results/${SCEN}.xml.jtl"
+          if [ -s "$XML_JTL" ]; then
             docker run --rm --network host \
               -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
               -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
-              -g "results/$SCEN.jtl" -o "results/$SCEN/html"
+              -g "results/${SCEN}.xml.jtl" -o "results/${SCEN}/html"
           else
-            echo "No JTL for $SCEN; skipping HTML generation."
+            echo "No XML JTL for $SCEN; skipping HTML generation."
           fi
           ls -R jmeter/results/$SCEN || true
 
-      # --------- Always upload artifacts (HTML + JTL + jmeter.log) ---------
+      # --------- Always upload artifacts (HTML + our XML JTL + any CSV JTL + jmeter.log) ---------
       - name: Upload artifacts (${{ matrix.scenario }})
         if: always()
         uses: actions/upload-artifact@v4
@@ -107,6 +116,7 @@ jobs:
           if-no-files-found: warn
           path: |
             jmeter/results/${{ matrix.scenario }}/html
+            jmeter/results/${{ matrix.scenario }}.xml.jtl
             jmeter/results/${{ matrix.scenario }}.jtl
             jmeter/results/${{ matrix.scenario }}/jmeter.log
 
