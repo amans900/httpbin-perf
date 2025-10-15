@@ -16,7 +16,7 @@ mkdir -p jmeter/results
 SCENARIO="load"
 mkdir -p "jmeter/results/load"
 
-docker run --rm   --network httpbin-perf_perfnet   -v "$PWD/jmeter":/jmeter   -w /jmeter   jmeter:5.6.3   -q config/user.properties   -n -t testplans/httpbin_load.jmx   -Jthreads="${THREADS}" -Jrampup="${RAMPUP}" -Jduration="${DURATION}"   -Jtarget_host="${TARGET_HOST}" -Jtarget_port="${TARGET_PORT}"   -Jscenario_name="${SCENARIO}"   -l results/${SCENARIO}.jtl
+docker run --rm   --network httpbin-perf_perfnet   -v "$PWD/jmeter":/jmeter   -w /jmeter   jmeter:5.6.3   -q config/user.properties   -n -t testplans/httpbin_load.jmx   -Jthreads="${THREADS}" -Jrampup="${RAMPUP}" -Jduration="${DURATION}"   -Jtarget_host="${TARGET_HOST}" -Jtarget_port="${TARGET_PORT}"   -Jscenario_name="${SCENARIO}"   -l results/${SCENARIO}_1.jtl
 
 # HTML report
 docker run --rm   -v "$PWD/jmeter":/jmeter   -w /jmeter   jmeter:5.6.3   -g results/${SCENARIO}.jtl -o results/load/html
