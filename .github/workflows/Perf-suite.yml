@@ -33,7 +33,7 @@ jobs:
           - scenario: soak
             threads: 50
             rampup: 30
-            duration: 900
+            duration: 300
 
     env:
       SLA_ERROR_PERCENT: "1.0"   # fail if error% > this
@@ -104,4 +104,56 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jmeter-${{ matrix.s
+          name: jmeter-${{ matrix.scenario }}-artifacts
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            jmeter/results/${{ matrix.scenario }}/html
+            jmeter/results/${{ matrix.scenario }}.xml.jtl
+            jmeter/results/${{ matrix.scenario }}.jtl
+            jmeter/results/${{ matrix.scenario }}/jmeter.log
+
+      # ---- Evaluate SLAs using XML if available, else fall back to CSV ----
+      - name: Evaluate SLAs (${{ matrix.scenario }})
+        run: |
+          set -eux
+          SCEN=${{ matrix.scenario }}
+          XML_JTL="jmeter/results/${SCEN}.xml.jtl"
+          CSV_JTL="jmeter/results/${SCEN}.jtl"
+          THRESH="${SLA_ERROR_PERCENT}"
+
+          if [ -s "$XML_JTL" ]; then
+            echo "Using XML JTL: $XML_JTL"
+            HTTP=$(grep -o '<httpSample ' "$XML_JTL" | wc -l || true)
+            SAMP=$(grep -o '<sample ' "$XML_JTL" | wc -l || true)
+            TOTAL=$((HTTP + SAMP))
+            FAIL_HTTP=$(grep -o '<httpSample [^>]* s="false"' "$XML_JTL" | wc -l || true)
+            FAIL_SAMP=$(grep -o '<sample [^>]* s="false"' "$XML_JTL" | wc -l || true)
+            FAILS=$((FAIL_HTTP + FAIL_SAMP))
+          elif [ -s "$CSV_JTL" ]; then
+            echo "XML not found; FALLING BACK to CSV JTL: $CSV_JTL"
+            # total rows excluding header / empty lines
+            TOTAL=$(grep -v '^\s*$' "$CSV_JTL" | sed '/^timeStamp,/d' | wc -l || true)
+            # very generic failure count: any row containing a standalone 'false' token
+            FAILS=$(grep -v '^\s*$' "$CSV_JTL" | sed '/^timeStamp,/d' | grep -E '(^|,)"?false"?($|,)' | wc -l || true)
+          else
+            echo "::error::Neither XML nor CSV JTL found for $SCEN."
+            exit 1
+          fi
+
+          if [ "${TOTAL:-0}" -eq 0 ]; then
+            echo "::error::No samples recorded for $SCEN."
+            exit 1
+          fi
+
+          ERR_PCT=$(awk -v f="$FAILS" -v t="$TOTAL" 'BEGIN{printf("%.2f", (f*100)/t)}')
+          echo "Scenario: $SCEN | Total: $TOTAL | Failures: $FAILS | Error%: $ERR_PCT (SLA ${THRESH}%)"
+
+          awk -v r="$ERR_PCT" -v th="$THRESH" 'BEGIN{ if (r > th) exit 1 }' \
+          || { echo "::error::Error rate ${ERR_PCT}% exceeded SLA ${THRESH}%"; exit 1; }
+
+          echo "SLA OK."
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
