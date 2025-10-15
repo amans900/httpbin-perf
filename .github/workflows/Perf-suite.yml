@@ -105,6 +105,20 @@ jobs:
           ls -l "$ROOT" || true
           ls -l "$OUT" || true
 
+      - name: Upload artifacts (${{ matrix.scenario }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jmeter-${{ matrix.scenario }}-artifacts
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            jmeter/results/${{ matrix.scenario }}/html
+            jmeter/results/${{ matrix.scenario }}.csv
+            jmeter/results/${{ matrix.scenario }}/jmeter.log
+            jmeter/results/${{ matrix.scenario }}/grafana
+
+
       # ---- Upload artifacts for each scenario ----
       - name: Upload artifacts (${{ matrix.scenario }})
         if: always()
@@ -117,6 +131,58 @@ jobs:
             jmeter/results/${{ matrix.scenario }}/html
             jmeter/results/${{ matrix.scenario }}.csv
             jmeter/results/${{ matrix.scenario }}/jmeter.log
+
+      - name: Render Grafana panels (${{ matrix.scenario }})
+        if: always()
+        run: |
+          set -eux
+          SCEN=${{ matrix.scenario }}
+          RAMP=${{ matrix.rampup }}
+          DUR=${{ matrix.duration }}
+          RANGE=$((RAMP + DUR + 120))   # seconds back from now
+          TO_ms=$(( $(date -u +%s) * 1000 ))
+          FROM_ms=$(( $(date -u -d "-${RANGE} seconds" +%s) * 1000 ))
+
+          OUT_DIR="jmeter/results/${SCEN}/grafana"
+          mkdir -p "${OUT_DIR}"
+
+          # Wait for Grafana + renderer to be ready
+          for i in {1..30}; do
+            curl -fsS http://localhost:3000/api/health >/dev/null && break || sleep 2
+          done
+
+          # --- OPTION A: use admin/basic auth (set above in compose) ---
+          AUTH="admin:admin"
+          AUTH_FLAG="-u ${AUTH}"
+
+          # If you know your JMeter dashboard UID, put it here.
+          # If you provisioned from this repo, you can read it from the JSON file:
+          JM_DASH_UID=$(jq -r '.uid // .dashboard.uid' grafana/dashboards/jmeter-overview.json 2>/dev/null || echo "jmeter-overview")
+
+          # Helper to render one panel by id into a file
+          render_panel () {
+            local panel_id="$1"
+            local outfile="$2"
+            curl -fsSL ${AUTH_FLAG} \
+              "http://localhost:3000/render/d-solo/${JM_DASH_UID}?orgId=1&panelId=${panel_id}&from=${FROM_ms}&to=${TO_ms}&width=1600&height=800&tz=UTC&theme=dark" \
+              -o "${outfile}"
+          }
+
+          # If you don't know your panel IDs, print them once:
+          echo "Listing available panels (id: title):"
+          curl -fsSL ${AUTH_FLAG} "http://localhost:3000/api/dashboards/uid/${JM_DASH_UID}" \
+            | jq -r '.dashboard.panels[] | "\(.id): \(.title)"' || true
+
+          # >>>> SET THESE to match your dashboard <<<<
+          RPS_ID=${RPS_ID:-2}
+          ERR_ID=${ERR_ID:-4}
+          LAT_ID=${LAT_ID:-3}
+
+          render_panel "${RPS_ID}" "${OUT_DIR}/requests_per_second.png" || true
+          render_panel "${ERR_ID}" "${OUT_DIR}/error_percent.png"       || true
+          render_panel "${LAT_ID}" "${OUT_DIR}/latency.png"             || true
+
+          ls -l "${OUT_DIR}" || true
 
       - name: Stop stack
         if: always()
