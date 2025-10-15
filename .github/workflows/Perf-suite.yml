@@ -1,139 +1,138 @@
 name: perf-suite
+
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
+  # schedule:
+  #   - cron: "0 2 * * *"  # nightly (optional)
 
 jobs:
-  run-suite:
+  jmeter-matrix:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      # tweak loads here in the UI
-      SMOKE_THREADS: "30"
-      SMOKE_RAMPUP:  "10"
-      SMOKE_DURATION: "45"
-
-      LOAD_THREADS:  "120"
-      LOAD_RAMPUP:   "60"
-      LOAD_DURATION: "120"
-
-      SPIKE_THREADS: "250"
-      SPIKE_RAMPUP:  "10"
-      SPIKE_DURATION: "60"
-
-      STRESS_THREADS: "400"
-      STRESS_RAMPUP: "60"
-      STRESS_DURATION: "120"
-
-      SOAK_THREADS:  "40"
-      SOAK_RAMPUP:   "20"
-      SOAK_DURATION: "180"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: smoke
+            threads: 50
+            rampup: 30
+            duration: 60
+          - scenario: load
+            threads: 100
+            rampup: 60
+            duration: 180
+          - scenario: stress
+            threads: 300
+            rampup: 60
+            duration: 120
+          - scenario: spike
+            threads: 200
+            rampup: 10
+            duration: 60
+          - scenario: soak
+            threads: 50
+            rampup: 30
+            duration: 900
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Start the stack (includes Prometheus/Grafana/Loki for completeness;
-      # their UIs won't be reachable from the runner)
-      - name: Start infra
+      - name: Start minimal infra (httpbin + monitoring)
         run: |
-          docker compose up -d influxdb httpbin prometheus cadvisor grafana loki promtail
+          set -eux
+          docker compose up -d influxdb httpbin grafana loki promtail prometheus cadvisor
           sleep 15
+          docker ps
 
-      - name: Build JMeter image
+      - name: Build JMeter image (5.6.3)
         run: docker build -t jmeter:5.6.3 ./jmeter/docker
 
-      - name: Run full suite
+      # ---- RUN TEST but DO NOT fail the job yet (capture exit code) ----
+      - name: Run ${{ matrix.scenario }} test (headless; write JTL + jmeter.log)
+        id: run_test
         run: |
-          set -euxo pipefail
+          set -eux
+          SCEN=${{ matrix.scenario }}
+          rm -rf jmeter/results/$SCEN jmeter/results/$SCEN.jtl || true
+          mkdir -p jmeter/results/$SCEN/html
 
-          run_scenario () {
-            SCEN="$1"; THR="$2"; RAMP="$3"; DUR="$4"
-            echo "==> ${SCEN} (threads=$THR rampup=$RAMP duration=$DUR)"
+          set +e
+          docker run --rm --network host \
+            -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
+            -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
+            -q config/user.properties \
+            -Jjmeter.save.saveservice.output_format=csv \
+            -Jjmeter.save.saveservice.print_field_names=true \
+            -Jjmeter.save.saveservice.default_delimiter=, \
+            -Jjmeter.save.saveservice.timestamp_format=ms \
+            -Jjmeter.save.saveservice.data_type=true \
+            -Jjmeter.save.saveservice.label=true \
+            -Jjmeter.save.saveservice.response_code=true \
+            -Jjmeter.save.saveservice.response_message=true \
+            -Jjmeter.save.saveservice.thread_name=true \
+            -Jjmeter.save.saveservice.successful=true \
+            -Jjmeter.save.saveservice.failure_message=true \
+            -Jjmeter.save.saveservice.bytes=true \
+            -Jjmeter.save.saveservice.sent_bytes=true \
+            -Jjmeter.save.saveservice.grp_threads=true \
+            -Jjmeter.save.saveservice.all_threads=true \
+            -Jjmeter.save.saveservice.URL=true \
+            -Jjmeter.save.saveservice.latency=true \
+            -Jjmeter.save.saveservice.idle_time=true \
+            -Jjmeter.save.saveservice.connect_time=true \
+            -n -t testplans/httpbin_load.jmx \
+            -Jthreads=${{ matrix.threads }} \
+            -Jrampup=${{ matrix.rampup }} \
+            -Jduration=${{ matrix.duration }} \
+            -Jscenario_name=$SCEN \
+            -Jtarget_host=localhost -Jtarget_port=8080 \
+            -l results/$SCEN.jtl \
+            -j results/$SCEN/jmeter.log
+          EXIT=$?
+          set -e
 
-            rm -rf jmeter/results/${SCEN} jmeter/results/${SCEN}.jtl || true
-            mkdir -p jmeter/results/${SCEN}/html
+          # log header if present
+          head -n 2 jmeter/results/$SCEN.jtl || true
+          echo "exit_code=$EXIT" >> $GITHUB_OUTPUT
 
-            # run JMeter (force CSV header + standard 17 cols so report always parses)
+      # ---- Generate HTML even if the run failed ----
+      - name: Generate HTML report (${{ matrix.scenario }})
+        if: always()
+        run: |
+          set -eux
+          SCEN=${{ matrix.scenario }}
+          if [ -s "jmeter/results/$SCEN.jtl" ]; then
             docker run --rm --network host \
+              -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
               -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
-              -q config/user.properties \
-              -Jjmeter.save.saveservice.output_format=csv \
-              -Jjmeter.save.saveservice.print_field_names=true \
-              -Jjmeter.save.saveservice.default_delimiter=, \
-              -Jjmeter.save.saveservice.timestamp_format=ms \
-              -Jjmeter.save.saveservice.data_type=true \
-              -Jjmeter.save.saveservice.label=true \
-              -Jjmeter.save.saveservice.response_code=true \
-              -Jjmeter.save.saveservice.response_message=true \
-              -Jjmeter.save.saveservice.thread_name=true \
-              -Jjmeter.save.saveservice.successful=true \
-              -Jjmeter.save.saveservice.failure_message=true \
-              -Jjmeter.save.saveservice.bytes=true \
-              -Jjmeter.save.saveservice.sent_bytes=true \
-              -Jjmeter.save.saveservice.grp_threads=true \
-              -Jjmeter.save.saveservice.all_threads=true \
-              -Jjmeter.save.saveservice.URL=true \
-              -Jjmeter.save.saveservice.latency=true \
-              -Jjmeter.save.saveservice.idle_time=true \
-              -Jjmeter.save.saveservice.connect_time=true \
-              -n -t testplans/httpbin_load.jmx \
-              -Jthreads="${THR}" -Jrampup="${RAMP}" -Jduration="${DUR}" \
-              -Jtarget_host=localhost -Jtarget_port=8080 \
-              -Jscenario_name="${SCEN}" \
-              -l results/${SCEN}.jtl
+              -g results/$SCEN.jtl -o results/$SCEN/html
+          else
+            echo "No JTL found for $SCEN; skipping HTML generation."
+          fi
+          ls -R jmeter/results/$SCEN || true
 
-            head -n 2 jmeter/results/${SCEN}.jtl || true
-
-            docker run --rm --network host \
-              -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
-              -g results/${SCEN}.jtl -o results/${SCEN}/html
-          }
-
-          run_scenario smoke  "$SMOKE_THREADS"  "$SMOKE_RAMPUP"  "$SMOKE_DURATION"
-          run_scenario load   "$LOAD_THREADS"   "$LOAD_RAMPUP"   "$LOAD_DURATION"
-          run_scenario spike  "$SPIKE_THREADS"  "$SPIKE_RAMPUP"  "$SPIKE_DURATION"
-          run_scenario stress "$STRESS_THREADS" "$STRESS_RAMPUP" "$STRESS_DURATION"
-          run_scenario soak   "$SOAK_THREADS"   "$SOAK_RAMPUP"   "$SOAK_DURATION"
-
-          # build a simple landing page for Pages
-          cat > jmeter/results/index.html <<'HTML'
-          <!doctype html><meta charset="utf-8"><title>httpbin-perf reports</title>
-          <h1>httpbin-perf — JMeter Reports</h1>
-          <ul>
-            <li><a href="smoke/html/index.html">Smoke</a></li>
-            <li><a href="load/html/index.html">Load</a></li>
-            <li><a href="spike/html/index.html">Spike</a></li>
-            <li><a href="stress/html/index.html">Stress</a></li>
-            <li><a href="soak/html/index.html">Soak</a></li>
-          </ul>
-          HTML
-          touch jmeter/results/.nojekyll
-
-      - name: Upload site (reports) as Pages artifact
-        uses: actions/upload-pages-artifact@v3
+      # ---- Always upload artifacts, even on failure ----
+      - name: Upload artifacts (${{ matrix.scenario }})
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          path: jmeter/results
+          name: jmeter-${{ matrix.scenario }}-artifacts
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            jmeter/results/${{ matrix.scenario }}/html
+            jmeter/results/${{ matrix.scenario }}.jtl
+            jmeter/results/${{ matrix.scenario }}/jmeter.log
 
-  deploy:
-    needs: run-suite
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-      - name: Deploy to Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
+
+      # ---- Mark the job failed at the very end if JMeter failed ----
+      - name: Fail job if scenario failed
+        if: steps.run_test.outputs.exit_code != '0'
+        run: |
+          echo "JMeter exit code: ${{ steps.run_test.outputs.exit_code }}"
+          exit 1
