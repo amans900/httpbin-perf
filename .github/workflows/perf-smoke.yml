@@ -2,27 +2,74 @@ name: perf-smoke
 
 on:
   push:
-    branches: [ "main" ]
-  workflow_dispatch: {}
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   jmeter-smoke:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start minimal infra
+        run: |
+          docker compose up -d influxdb httpbin grafana loki promtail prometheus cadvisor
+          sleep 15
+
       - name: Build JMeter image
         run: docker build -t jmeter:5.6.3 ./jmeter/docker
-      - name: Start minimal infra
-        run: docker compose up -d influxdb httpbin
+
       - name: Run smoke test
         run: |
-          chmod +x scripts/run-smoke.sh
-          ./scripts/run-smoke.sh
+          set -euxo pipefail
+          # clean old results so we don't append to a stale JTL
+          rm -rf jmeter/results/smoke jmeter/results/smoke.jtl || true
+          mkdir -p jmeter/results/smoke/html
+
+          # run JMeter and FORCE CSV header + standard 17 columns
+          docker run --rm --network host \
+            -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
+            -q config/user.properties \
+            -Jjmeter.save.saveservice.output_format=csv \
+            -Jjmeter.save.saveservice.print_field_names=true \
+            -Jjmeter.save.saveservice.default_delimiter=, \
+            -Jjmeter.save.saveservice.timestamp_format=ms \
+            -Jjmeter.save.saveservice.data_type=true \
+            -Jjmeter.save.saveservice.label=true \
+            -Jjmeter.save.saveservice.response_code=true \
+            -Jjmeter.save.saveservice.response_message=true \
+            -Jjmeter.save.saveservice.thread_name=true \
+            -Jjmeter.save.saveservice.successful=true \
+            -Jjmeter.save.saveservice.failure_message=true \
+            -Jjmeter.save.saveservice.bytes=true \
+            -Jjmeter.save.saveservice.sent_bytes=true \
+            -Jjmeter.save.saveservice.grp_threads=true \
+            -Jjmeter.save.saveservice.all_threads=true \
+            -Jjmeter.save.saveservice.URL=true \
+            -Jjmeter.save.saveservice.latency=true \
+            -Jjmeter.save.saveservice.idle_time=true \
+            -Jjmeter.save.saveservice.connect_time=true \
+            -n -t testplans/httpbin_load.jmx \
+            -Jthreads=50 -Jrampup=30 -Jduration=60 \
+            -Jtarget_host=localhost -Jtarget_port=8080 \
+            -l results/smoke.jtl
+
+          # show header to prove format is correct
+          head -n 2 jmeter/results/smoke.jtl
+
+          # generate HTML
+          docker run --rm --network host \
+            -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
+            -g results/smoke.jtl -o results/smoke/html
+
       - name: Upload HTML report
         uses: actions/upload-artifact@v4
         with:
-          name: jmeter-report
+          name: jmeter-smoke-report
           path: jmeter/results/smoke/html
-      - name: Stop
+
+      - name: Stop stack
         if: always()
         run: docker compose down -v
