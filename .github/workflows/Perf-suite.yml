@@ -1,0 +1,139 @@
+name: perf-suite
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  run-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # tweak loads here in the UI
+      SMOKE_THREADS: "30"
+      SMOKE_RAMPUP:  "10"
+      SMOKE_DURATION:"45"
+
+      LOAD_THREADS:  "120"
+      LOAD_RAMPUP:   "60"
+      LOAD_DURATION: "120"
+
+      SPIKE_THREADS: "250"
+      SPIKE_RAMPUP:  "10"
+      SPIKE_DURATION:"60"
+
+      STRESS_THREADS:"400"
+      STRESS_RAMPUP: "60"
+      STRESS_DURATION:"120"
+
+      SOAK_THREADS:  "40"
+      SOAK_RAMPUP:   "20"
+      SOAK_DURATION: "180"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Start the stack (includes Prometheus/Grafana/Loki for completeness;
+      # their UIs won't be reachable from the runner)
+      - name: Start infra
+        run: |
+          docker compose up -d influxdb httpbin prometheus cadvisor grafana loki promtail
+          sleep 15
+
+      - name: Build JMeter image
+        run: docker build -t jmeter:5.6.3 ./jmeter/docker
+
+      - name: Run full suite
+        run: |
+          set -euxo pipefail
+
+          run_scenario () {
+            SCEN="$1"; THR="$2"; RAMP="$3"; DUR="$4"
+            echo "==> ${SCEN} (threads=$THR rampup=$RAMP duration=$DUR)"
+
+            rm -rf jmeter/results/${SCEN} jmeter/results/${SCEN}.jtl || true
+            mkdir -p jmeter/results/${SCEN}/html
+
+            # run JMeter (force CSV header + standard 17 cols so report always parses)
+            docker run --rm --network host \
+              -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
+              -q config/user.properties \
+              -Jjmeter.save.saveservice.output_format=csv \
+              -Jjmeter.save.saveservice.print_field_names=true \
+              -Jjmeter.save.saveservice.default_delimiter=, \
+              -Jjmeter.save.saveservice.timestamp_format=ms \
+              -Jjmeter.save.saveservice.data_type=true \
+              -Jjmeter.save.saveservice.label=true \
+              -Jjmeter.save.saveservice.response_code=true \
+              -Jjmeter.save.saveservice.response_message=true \
+              -Jjmeter.save.saveservice.thread_name=true \
+              -Jjmeter.save.saveservice.successful=true \
+              -Jjmeter.save.saveservice.failure_message=true \
+              -Jjmeter.save.saveservice.bytes=true \
+              -Jjmeter.save.saveservice.sent_bytes=true \
+              -Jjmeter.save.saveservice.grp_threads=true \
+              -Jjmeter.save.saveservice.all_threads=true \
+              -Jjmeter.save.saveservice.URL=true \
+              -Jjmeter.save.saveservice.latency=true \
+              -Jjmeter.save.saveservice.idle_time=true \
+              -Jjmeter.save.saveservice.connect_time=true \
+              -n -t testplans/httpbin_load.jmx \
+              -Jthreads="${THR}" -Jrampup="${RAMP}" -Jduration="${DUR}" \
+              -Jtarget_host=localhost -Jtarget_port=8080 \
+              -Jscenario_name="${SCEN}" \
+              -l results/${SCEN}.jtl
+
+            head -n 2 jmeter/results/${SCEN}.jtl || true
+
+            docker run --rm --network host \
+              -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
+              -g results/${SCEN}.jtl -o results/${SCEN}/html
+          }
+
+          run_scenario smoke  "$SMOKE_THREADS"  "$SMOKE_RAMPUP"  "$SMOKE_DURATION"
+          run_scenario load   "$LOAD_THREADS"   "$LOAD_RAMPUP"   "$LOAD_DURATION"
+          run_scenario spike  "$SPIKE_THREADS"  "$SPIKE_RAMPUP"  "$SPIKE_DURATION"
+          run_scenario stress "$STRESS_THREADS" "$STRESS_RAMPUP" "$STRESS_DURATION"
+          run_scenario soak   "$SOAK_THREADS"   "$SOAK_RAMPUP"   "$SOAK_DURATION"
+
+          # build a simple landing page for Pages
+          cat > jmeter/results/index.html <<'HTML'
+          <!doctype html><meta charset="utf-8"><title>httpbin-perf reports</title>
+          <h1>httpbin-perf — JMeter Reports</h1>
+          <ul>
+            <li><a href="smoke/html/index.html">Smoke</a></li>
+            <li><a href="load/html/index.html">Load</a></li>
+            <li><a href="spike/html/index.html">Spike</a></li>
+            <li><a href="stress/html/index.html">Stress</a></li>
+            <li><a href="soak/html/index.html">Soak</a></li>
+          </ul>
+          HTML
+          touch jmeter/results/.nojekyll
+
+      - name: Upload site (reports) as Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: jmeter/results
+
+  deploy:
+    needs: run-suite
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy to Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
