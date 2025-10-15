@@ -25,7 +25,7 @@ jobs:
         run: |
           set -euxo pipefail
           # clean old results so we don't append to a stale JTL
-          rm -rf jmeter/results/smoke jmeter/results/smoke.jtl || true
+          rm -rf jmeter/results/smoke jmeter/results/smoke_1.jtl || true
           mkdir -p jmeter/results/smoke/html
 
           # run JMeter and FORCE CSV header + standard 17 columns
@@ -54,15 +54,15 @@ jobs:
             -n -t testplans/httpbin_load.jmx \
             -Jthreads=50 -Jrampup=30 -Jduration=60 \
             -Jtarget_host=localhost -Jtarget_port=8080 \
-            -l results/smoke.jtl
+            -l results/smoke_1.jtl
 
           # show header to prove format is correct
-          head -n 2 jmeter/results/smoke.jtl
+          head -n 2 jmeter/results/smoke_1.jtl
 
           # generate HTML
           docker run --rm --network host \
             -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
-            -g results/smoke.jtl -o results/smoke/html
+            -g results/smoke_1.jtl -o results/smoke/html
 
       - name: Upload HTML report
         uses: actions/upload-artifact@v4
