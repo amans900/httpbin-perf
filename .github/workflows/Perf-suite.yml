@@ -49,18 +49,20 @@ jobs:
       - name: Build JMeter image (5.6.3)
         run: docker build -t jmeter:5.6.3 ./jmeter/docker
 
-      # --------- RUN TEST (force XML JTL to a DIFFERENT filename; capture exit code) ---------
-      - name: Run ${{ matrix.scenario }} test (headless; XML JTL + jmeter.log)
+      # ---- Run test AND generate dashboard in ONE JMeter invocation ----
+      - name: Run ${{ matrix.scenario }} (headless; XML JTL; generate HTML)
         id: run_test
         run: |
           set -eux
           SCEN=${{ matrix.scenario }}
-          XML_JTL="jmeter/results/${SCEN}.xml.jtl"   # <-- our file (XML)
-          CSV_JTL="jmeter/results/${SCEN}.jtl"       # <-- file possibly written by the JMX (CSV)
-          mkdir -p jmeter/results/${SCEN}/html
-          rm -f "$XML_JTL" "$CSV_JTL" || true
+          OUT=jmeter/results/$SCEN
+          XML_JTL="jmeter/results/${SCEN}.xml.jtl"
+          CSV_JTL="jmeter/results/${SCEN}.jtl"  # may be written by JMX; we keep it for debugging
 
-          # Run headless and FORCE XML output via JVM_ARGS; write to our XML_JTL
+          rm -rf "$OUT" "$XML_JTL" "$CSV_JTL" || true
+          mkdir -p "$OUT"
+
+          # IMPORTANT: force XML at JVM level and create dashboard (-e -o) in the same process
           set +e
           docker run --rm --network host \
             -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m \
@@ -74,39 +76,21 @@ jobs:
             -Jscenario_name=$SCEN \
             -Jtarget_host=localhost -Jtarget_port=8080 \
             -l "results/${SCEN}.xml.jtl" \
-            -j "results/${SCEN}/jmeter.log"
+            -j "results/${SCEN}/jmeter.log" \
+            -e -o "results/${SCEN}/html"
           EXIT=$?
           set -e
 
-          echo "---- First line of our JTL (should be XML prolog) ----"
+          # Quick visibility for debugging
           head -n 1 "$XML_JTL" || true
-
-          # If the plan also wrote a CSV JTL to results/<scenario>.jtl, show a hint
+          test -f "$OUT/html/index.html" && echo "Dashboard generated." || echo "Dashboard missing."
           if [ -f "$CSV_JTL" ]; then
-            echo "Detected CSV written by JMX at $CSV_JTL (kept for debugging)."
+            echo "CSV also found (from JMX): $CSV_JTL"
             head -n 2 "$CSV_JTL" || true
           fi
 
           echo "exit_code=$EXIT" >> $GITHUB_OUTPUT
 
-      # --------- Generate HTML (always, using our XML JTL) ---------
-      - name: Generate HTML report (${{ matrix.scenario }})
-        if: always()
-        run: |
-          set -eux
-          SCEN=${{ matrix.scenario }}
-          XML_JTL="jmeter/results/${SCEN}.xml.jtl"
-          if [ -s "$XML_JTL" ]; then
-            docker run --rm --network host \
-              -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
-              -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
-              -g "results/${SCEN}.xml.jtl" -o "results/${SCEN}/html"
-          else
-            echo "No XML JTL for $SCEN; skipping HTML generation."
-          fi
-          ls -R jmeter/results/$SCEN || true
-
-      # --------- Always upload artifacts (HTML + our XML JTL + any CSV JTL + jmeter.log) ---------
       - name: Upload artifacts (${{ matrix.scenario }})
         if: always()
         uses: actions/upload-artifact@v4
@@ -124,7 +108,6 @@ jobs:
         if: always()
         run: docker compose down -v
 
-      # --------- Mark job failed at the very end if JMeter exited non-zero ---------
       - name: Fail job if scenario failed
         if: steps.run_test.outputs.exit_code != '0'
         run: |
