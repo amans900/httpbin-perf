@@ -11,34 +11,29 @@ jobs:
 
     steps:
       - name: Checkout
-      # Pull your repo into the runner
         uses: actions/checkout@v4
 
       - name: Start minimal infra (httpbin + monitoring)
         run: |
           set -eux
-          # Bring up only what we need for a smoke perf run
           docker compose up -d influxdb httpbin grafana loki promtail prometheus cadvisor
-          # brief wait so services are listening
           sleep 15
           docker ps
 
       - name: Build JMeter image (5.6.3)
         run: docker build -t jmeter:5.6.3 ./jmeter/docker
 
-      - name: Run smoke test (write JTL + jmeter.log with header/standard columns)
+      - name: Run smoke test (headless; write JTL + jmeter.log)
         run: |
           set -euxo pipefail
-
-          # Clean previous outputs so the JTL isn't appended to an old file
           rm -rf jmeter/results/smoke jmeter/results/smoke.jtl || true
           mkdir -p jmeter/results/smoke/html
 
-          # Use host networking so JMeter can hit httpbin exposed on 8080
+          # Run JMeter completely headless (no AWT) and force CSV header + standard columns
           docker run --rm --network host \
+            -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
             -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
             -q config/user.properties \
-            # --- force CSV with header + the standard 17 fields (prevents column mismatch) ---
             -Jjmeter.save.saveservice.output_format=csv \
             -Jjmeter.save.saveservice.print_field_names=true \
             -Jjmeter.save.saveservice.default_delimiter=, \
@@ -58,21 +53,20 @@ jobs:
             -Jjmeter.save.saveservice.latency=true \
             -Jjmeter.save.saveservice.idle_time=true \
             -Jjmeter.save.saveservice.connect_time=true \
-            # --- your test plan + runtime knobs ---
             -n -t testplans/httpbin_load.jmx \
             -Jthreads=50 -Jrampup=30 -Jduration=60 \
             -Jtarget_host=localhost -Jtarget_port=8080 \
-            # --- output files ---
             -l results/smoke.jtl \
             -j results/smoke/jmeter.log
 
-          # Show first two lines so we can prove the header exists (visible in job logs)
+          # Prove the JTL has a header (visible in logs)
           head -n 2 jmeter/results/smoke.jtl || true
 
-      - name: Generate HTML report
+      - name: Generate HTML report (headless)
         run: |
           set -eux
           docker run --rm --network host \
+            -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
             -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
             -g results/smoke.jtl -o results/smoke/html
           ls -R jmeter/results/smoke
