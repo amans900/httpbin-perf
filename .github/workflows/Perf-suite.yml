@@ -49,15 +49,17 @@ jobs:
       - name: Build JMeter image (5.6.3)
         run: docker build -t jmeter:5.6.3 ./jmeter/docker
 
-      # ---- RUN TEST but DO NOT fail the job yet (capture exit code) ----
+      # ------------------ RUN TEST (capture exit code, don't fail yet) ------------------
       - name: Run ${{ matrix.scenario }} test (headless; write JTL + jmeter.log)
         id: run_test
         run: |
           set -eux
           SCEN=${{ matrix.scenario }}
+
           rm -rf jmeter/results/$SCEN jmeter/results/$SCEN.jtl || true
           mkdir -p jmeter/results/$SCEN/html
 
+          # Run non-GUI, force 17-column CSV with header
           set +e
           docker run --rm --network host \
             -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
@@ -93,27 +95,59 @@ jobs:
           EXIT=$?
           set -e
 
-          # log header if present
+          echo "---- First two lines of JTL ----"
           head -n 2 jmeter/results/$SCEN.jtl || true
           echo "exit_code=$EXIT" >> $GITHUB_OUTPUT
 
-      # ---- Generate HTML even if the run failed ----
+      # ------------------ FIX JTL if header is missing or only 15 columns ------------------
+      - name: Normalize JTL (${{ matrix.scenario }})
+        if: always()
+        run: |
+          set -eux
+          SCEN=${{ matrix.scenario }}
+          FILE="jmeter/results/$SCEN.jtl"
+          HEADER='timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect'
+
+          if [ -s "$FILE" ]; then
+            FIRST=$(head -n1 "$FILE" || echo "")
+            # If header missing, or first data row has only 15 columns, fix it
+            if ! echo "$FIRST" | grep -q '^timeStamp,elapsed,label,'; then
+              echo "No header detected – adding standard header and padding to 17 columns if needed."
+              awk -F',' -v header="$HEADER" 'BEGIN{print header}
+                NR>1{
+                  # pad to 17 fields by appending empty columns (covers 15-col legacy format)
+                  while (NF < 17) { $0 = $0 ","; NF++ }
+                  print
+                }' OFS=',' "$FILE" > "$FILE.fixed"
+              mv "$FILE.fixed" "$FILE"
+            else
+              # Header exists; verify all rows have 17 fields, pad if not
+              awk -F',' 'NR==1{print; next} { while (NF<17) { $0=$0","; NF++ } print }' OFS=',' "$FILE" > "$FILE.fixed"
+              mv "$FILE.fixed" "$FILE"
+            fi
+            head -n 2 "$FILE" || true
+          else
+            echo "No JTL found for $SCEN – skipping normalization."
+          fi
+
+      # ------------------ Generate HTML (even if test failed) ------------------
       - name: Generate HTML report (${{ matrix.scenario }})
         if: always()
         run: |
           set -eux
           SCEN=${{ matrix.scenario }}
-          if [ -s "jmeter/results/$SCEN.jtl" ]; then
+          FILE="jmeter/results/$SCEN.jtl"
+          if [ -s "$FILE" ]; then
             docker run --rm --network host \
               -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
               -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
-              -g results/$SCEN.jtl -o results/$SCEN/html
+              -g "results/$SCEN.jtl" -o "results/$SCEN/html"
           else
-            echo "No JTL found for $SCEN; skipping HTML generation."
+            echo "No JTL for $SCEN; skipping HTML generation."
           fi
           ls -R jmeter/results/$SCEN || true
 
-      # ---- Always upload artifacts, even on failure ----
+      # ------------------ Always upload artifacts ------------------
       - name: Upload artifacts (${{ matrix.scenario }})
         if: always()
         uses: actions/upload-artifact@v4
@@ -130,7 +164,7 @@ jobs:
         if: always()
         run: docker compose down -v
 
-      # ---- Mark the job failed at the very end if JMeter failed ----
+      # ------------------ Fail job only at the end if JMeter failed ------------------
       - name: Fail job if scenario failed
         if: steps.run_test.outputs.exit_code != '0'
         run: |
