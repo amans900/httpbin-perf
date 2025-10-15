@@ -14,24 +14,24 @@ jobs:
         include:
           - scenario: smoke
             threads: 50
-            rampup: 30
+            rampup: 50
             duration: 60
           - scenario: load
-            threads: 100
-            rampup: 60
-            duration: 180
-          - scenario: stress
             threads: 300
-            rampup: 60
-            duration: 120
+            rampup: 300
+            duration: 1800
+          - scenario: stress
+            threads: 400
+            rampup: 400
+            duration: 1800
           - scenario: spike
-            threads: 200
+            threads: 300
             rampup: 10
-            duration: 60
+            duration: 600
           - scenario: soak
-            threads: 50
-            rampup: 30
-            duration: 300
+            threads: 200
+            rampup: 250
+            duration: 3600
 
     steps:
       - name: Checkout
