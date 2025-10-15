@@ -5,7 +5,7 @@ on:
     branches: [ main ]
   workflow_dispatch:
   # schedule:
-  #   - cron: "0 2 * * *"  # nightly (optional)
+  #   - cron: "0 2 * * *"   # optional nightly
 
 jobs:
   jmeter-matrix:
@@ -14,23 +14,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - scenario: smoke
+          - scenario: smoke   # quick confidence check
             threads: 50
             rampup: 30
             duration: 60
-          - scenario: load
+          - scenario: load    # sustained expected traffic
             threads: 100
             rampup: 60
             duration: 180
-          - scenario: stress
+          - scenario: stress  # find breaking point
             threads: 300
             rampup: 60
             duration: 120
-          - scenario: spike
+          - scenario: spike   # sudden surge
             threads: 200
             rampup: 10
             duration: 60
-          - scenario: soak
+          - scenario: soak    # stability over time
             threads: 50
             rampup: 30
             duration: 900
@@ -49,7 +49,7 @@ jobs:
       - name: Build JMeter image (5.6.3)
         run: docker build -t jmeter:5.6.3 ./jmeter/docker
 
-      # ------------------ RUN TEST (write XML JTL) ------------------
+      # --------- RUN TEST (force XML JTL at JVM level; capture exit code) ---------
       - name: Run ${{ matrix.scenario }} test (headless; XML JTL + jmeter.log)
         id: run_test
         run: |
@@ -58,23 +58,13 @@ jobs:
           rm -rf jmeter/results/$SCEN jmeter/results/$SCEN.jtl || true
           mkdir -p jmeter/results/$SCEN/html
 
-          # Run JMeter headless and force XML output to avoid CSV column issues
+          # Run headless and FORCE XML output via JVM_ARGS so no CSV/column issues can occur
           set +e
           docker run --rm --network host \
-            -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
+            -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m \
+                         -Djmeter.save.saveservice.output_format=xml \
+                         -Djmeter.save.saveservice.assertion_results=none" \
             -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
-            -q config/user.properties \
-            -Jjmeter.save.saveservice.output_format=xml \
-            -Jjmeter.save.saveservice.assertion_results=none \
-            -Jjmeter.save.saveservice.response_message=true \
-            -Jjmeter.save.saveservice.response_code=true \
-            -Jjmeter.save.saveservice.successful=true \
-            -Jjmeter.save.saveservice.bytes=true \
-            -Jjmeter.save.saveservice.sent_bytes=true \
-            -Jjmeter.save.saveservice.url=true \
-            -Jjmeter.save.saveservice.latency=true \
-            -Jjmeter.save.saveservice.idle_time=true \
-            -Jjmeter.save.saveservice.connect_time=true \
             -n -t testplans/httpbin_load.jmx \
             -Jthreads=${{ matrix.threads }} \
             -Jrampup=${{ matrix.rampup }} \
@@ -86,11 +76,11 @@ jobs:
           EXIT=$?
           set -e
 
-          # Show the first line (should be XML prolog)
+          # Proof: first line should be XML prolog
           head -n 1 jmeter/results/$SCEN.jtl || true
           echo "exit_code=$EXIT" >> $GITHUB_OUTPUT
 
-      # ------------------ Generate HTML (works with XML JTL) ------------------
+      # --------- Generate HTML (even if the test failed) ---------
       - name: Generate HTML report (${{ matrix.scenario }})
         if: always()
         run: |
@@ -107,7 +97,7 @@ jobs:
           fi
           ls -R jmeter/results/$SCEN || true
 
-      # ------------------ Always upload artifacts ------------------
+      # --------- Always upload artifacts (HTML + JTL + jmeter.log) ---------
       - name: Upload artifacts (${{ matrix.scenario }})
         if: always()
         uses: actions/upload-artifact@v4
@@ -124,7 +114,7 @@ jobs:
         if: always()
         run: docker compose down -v
 
-      # ------------------ Fail job only at the end if JMeter failed ------------------
+      # --------- Mark job failed at the very end if JMeter exited non-zero ---------
       - name: Fail job if scenario failed
         if: steps.run_test.outputs.exit_code != '0'
         run: |
