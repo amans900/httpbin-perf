@@ -35,6 +35,11 @@ jobs:
             rampup: 30
             duration: 300
 
+    env:
+      # --- tweak these SLAs as you like ---
+      SLA_ERROR_PERCENT: "1.0"   # fail if error% > this
+      # You can add more later (p95 latency, etc.)
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,7 +54,7 @@ jobs:
       - name: Build JMeter image (5.6.3)
         run: docker build -t jmeter:5.6.3 ./jmeter/docker
 
-      # ---- Run test AND generate dashboard in ONE JMeter invocation ----
+      # ---- Run test AND generate dashboard; do not fail the job here ----
       - name: Run ${{ matrix.scenario }} (headless; XML JTL; generate HTML)
         id: run_test
         run: |
@@ -57,12 +62,12 @@ jobs:
           SCEN=${{ matrix.scenario }}
           OUT=jmeter/results/$SCEN
           XML_JTL="jmeter/results/${SCEN}.xml.jtl"
-          CSV_JTL="jmeter/results/${SCEN}.jtl"  # may be written by JMX; we keep it for debugging
+          CSV_JTL="jmeter/results/${SCEN}.jtl"  # may be written by JMX; keep for debugging
 
           rm -rf "$OUT" "$XML_JTL" "$CSV_JTL" || true
           mkdir -p "$OUT"
 
-          # IMPORTANT: force XML at JVM level and create dashboard (-e -o) in the same process
+          # Force XML JTL and build dashboard in the same process (-e -o)
           set +e
           docker run --rm --network host \
             -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m \
@@ -81,7 +86,7 @@ jobs:
           EXIT=$?
           set -e
 
-          # Quick visibility for debugging
+          echo "JMeter raw exit code: $EXIT"
           head -n 1 "$XML_JTL" || true
           test -f "$OUT/html/index.html" && echo "Dashboard generated." || echo "Dashboard missing."
           if [ -f "$CSV_JTL" ]; then
@@ -89,6 +94,7 @@ jobs:
             head -n 2 "$CSV_JTL" || true
           fi
 
+          # Store the raw exit code for visibility (we won't fail the job only because of it)
           echo "exit_code=$EXIT" >> $GITHUB_OUTPUT
 
       - name: Upload artifacts (${{ matrix.scenario }})
@@ -104,12 +110,38 @@ jobs:
             jmeter/results/${{ matrix.scenario }}.jtl
             jmeter/results/${{ matrix.scenario }}/jmeter.log
 
+      # ---- Evaluate SLAs from XML JTL and decide pass/fail here ----
+      - name: Evaluate SLAs (${{ matrix.scenario }})
+        run: |
+          set -eux
+          SCEN=${{ matrix.scenario }}
+          XML_JTL="jmeter/results/${SCEN}.xml.jtl"
+
+          if [ ! -s "$XML_JTL" ]; then
+            echo "::error::Missing XML JTL ($XML_JTL)."
+            exit 1
+          fi
+
+          # Count total HTTP samples and failures from XML
+          TOTAL=$(grep -o '<httpSample ' "$XML_JTL" | wc -l || true)
+          # include transaction controllers if you use <sample ...>, add: + $(grep -o '<sample ' ... | wc -l)
+          FAILS=$(grep -o ' s="false"' "$XML_JTL" | wc -l || true)
+
+          if [ "${TOTAL:-0}" -eq 0 ]; then
+            echo "::error::No samples recorded."
+            exit 1
+          fi
+
+          ERR_PCT=$(awk -v f="$FAILS" -v t="$TOTAL" 'BEGIN{printf("%.2f", (f*100)/t)}')
+          echo "Scenario: $SCEN | Total: $TOTAL | Failures: $FAILS | Error%: $ERR_PCT"
+
+          THRESH="${SLA_ERROR_PERCENT}"
+          # Fail if error% > threshold
+          awk -v r="$ERR_PCT" -v th="$THRESH" 'BEGIN{ if (r > th) { exit 1 } }' \
+          || { echo "::error::Error rate ${ERR_PCT}% exceeded SLA ${THRESH}%"; exit 1; }
+
+          echo "SLA OK: error ${ERR_PCT}% ≤ ${THRESH}%"
+
       - name: Stop stack
         if: always()
         run: docker compose down -v
-
-      - name: Fail job if scenario failed
-        if: steps.run_test.outputs.exit_code != '0'
-        run: |
-          echo "JMeter exit code: ${{ steps.run_test.outputs.exit_code }}"
-          exit 1
