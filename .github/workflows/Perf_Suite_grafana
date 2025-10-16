@@ -1,0 +1,193 @@
+name: perf-suite
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  jmeter-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: smoke
+            threads: 50
+            rampup: 30
+            duration: 60
+          - scenario: load
+            threads: 100
+            rampup: 60
+            duration: 180
+          - scenario: stress
+            threads: 300
+            rampup: 60
+            duration: 120
+          - scenario: spike
+            threads: 200
+            rampup: 10
+            duration: 60
+          - scenario: soak
+            threads: 50
+            rampup: 30
+            duration: 900
+
+    env:
+      # Grafana base URL and dashboard UIDs from the URLs you provided
+      GRAFANA_URL: http://localhost:3000
+      # /d/JMeterOverview/jmeter-overview?orgId=1
+      GRAFANA_JMETER_UID: JMeterOverview
+      # /d/container-metrics/container-metrics-cadvisor?orgId=1
+      GRAFANA_CAD_UID: container-metrics
+      # Basic auth (match your docker-compose env)
+      GRAFANA_AUTH: admin:admin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start minimal infra (httpbin + monitoring + grafana)
+        run: |
+          set -eux
+          # Start what you need; make sure compose has grafana + renderer configured
+          docker compose up -d influxdb httpbin grafana renderer loki promtail prometheus cadvisor
+
+          # Wait for Grafana HTTP API to be ready
+          for i in {1..60}; do
+            curl -fsS "${GRAFANA_URL}/api/health" >/dev/null && break || sleep 2
+          done
+
+      - name: Build JMeter image (5.6.3)
+        run: docker build -t jmeter:5.6.3 ./jmeter/docker
+
+      # ----------------- Run test (capture precise start time) -----------------
+      - name: Run ${{ matrix.scenario }} (CSV JTL + HTML report in one process)
+        id: run_test
+        run: |
+          set -eux
+          SCEN=${{ matrix.scenario }}
+          ROOT=jmeter/results
+          OUT="$ROOT/$SCEN"
+          CSV_JTL="$ROOT/${SCEN}.csv"
+
+          mkdir -p "$OUT"
+          rm -f "$CSV_JTL" || true
+          rm -rf "$OUT/html" || true
+
+          # Record exact scenario start time (ms since epoch)
+          START_MS=$(( $(date -u +%s) * 1000 ))
+          echo "start_ms=${START_MS}" >> "$GITHUB_OUTPUT"
+
+          # Force the standard 17-col CSV with header and generate dashboard (-e -o)
+          set +e
+          docker run --rm --network host \
+            -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
+            -v "$GITHUB_WORKSPACE/jmeter:/jmeter" -w /jmeter jmeter:5.6.3 \
+            -n -t testplans/httpbin_load.jmx \
+            -Jthreads=${{ matrix.threads }} \
+            -Jrampup=${{ matrix.rampup }} \
+            -Jduration=${{ matrix.duration }} \
+            -Jscenario_name=$SCEN \
+            -Jtarget_host=localhost -Jtarget_port=8080 \
+            -Jjmeter.save.saveservice.output_format=csv \
+            -Jjmeter.save.saveservice.print_field_names=true \
+            -Jjmeter.save.saveservice.default_delimiter=, \
+            -Jjmeter.save.saveservice.timestamp_format=ms \
+            -Jjmeter.save.saveservice.data_type=true \
+            -Jjmeter.save.saveservice.label=true \
+            -Jjmeter.save.saveservice.response_code=true \
+            -Jjmeter.save.saveservice.response_message=true \
+            -Jjmeter.save.saveservice.thread_name=true \
+            -Jjmeter.save.saveservice.successful=true \
+            -Jjmeter.save.saveservice.failure_message=true \
+            -Jjmeter.save.saveservice.bytes=true \
+            -Jjmeter.save.saveservice.sent_bytes=true \
+            -Jjmeter.save.saveservice.grp_threads=true \
+            -Jjmeter.save.saveservice.all_threads=true \
+            -Jjmeter.save.saveservice.url=true \
+            -Jjmeter.save.saveservice.latency=true \
+            -Jjmeter.save.saveservice.idle_time=true \
+            -Jjmeter.save.saveservice.connect_time=true \
+            -l "results/${SCEN}.csv" \
+            -j "results/${SCEN}/jmeter.log" \
+            -e -o "results/${SCEN}/html"
+          EXIT=$?
+          set -e
+
+          echo "JMeter exit code (info): $EXIT"
+          head -n 1 "$CSV_JTL" || true
+          test -f "$OUT/html/index.html" && echo "Dashboard generated." || echo "Dashboard missing."
+          ls -l "$OUT" || true
+
+      # ----------------- Render Grafana PNGs for exact run window -----------------
+      - name: Render Grafana panels (${{ matrix.scenario }})
+        if: always()
+        run: |
+          set -eux
+          SCEN=${{ matrix.scenario }}
+          OUT_DIR="jmeter/results/${SCEN}/grafana"
+          mkdir -p "${OUT_DIR}"
+
+          # Time window: from scenario start (captured earlier) to *now*
+          FROM_MS="${{ steps.run_test.outputs.start_ms }}"
+          TO_MS=$(( $(date -u +%s) * 1000 ))
+
+          # Ensure Grafana is up (in case it restarted)
+          for i in {1..30}; do
+            curl -fsS "${GRAFANA_URL}/api/health" >/dev/null && break || sleep 2
+          done
+
+          AUTH_FLAG="-u ${GRAFANA_AUTH}"
+
+          list_panels () {
+            local uid="$1"
+            curl -fsSL ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${uid}" \
+              | jq -r '
+                  .dashboard
+                  | .. | objects
+                  | select(has("id") and has("title"))
+                  | select(.type != "row")
+                  | "\(.id)\t\(.title)"'
+          }
+
+          render_panel () {
+            local uid="$1"; local pid="$2"; shift 2
+            local title="$*"
+            # sanitize title for filename
+            local base="$(echo "$title" | tr -cs '[:alnum:]_-' '_' | sed 's/_\+/_/g' | sed 's/^_//;s/_$//')"
+            local file="${OUT_DIR}/${uid}_${pid}_${base}.png"
+            curl -fsSL ${AUTH_FLAG} \
+              "${GRAFANA_URL}/render/d-solo/${uid}?orgId=1&panelId=${pid}&from=${FROM_MS}&to=${TO_MS}&width=1600&height=800&tz=UTC&theme=dark" \
+              -o "${file}" || true
+            echo "Saved: ${file}"
+          }
+
+          # Dashboards to render (from your links)
+          for DASH_UID in "${GRAFANA_JMETER_UID}" "${GRAFANA_CAD_UID}"; do
+            echo "Rendering dashboard UID=${DASH_UID}  window: ${FROM_MS} → ${TO_MS}"
+            list_panels "${DASH_UID}" | while IFS=$'\t' read -r pid title; do
+              echo "  panelId=${pid} title=${title}"
+              render_panel "${DASH_UID}" "${pid}" "${title}"
+            done
+          done
+
+          ls -l "${OUT_DIR}" || true
+
+      # ----------------- Upload *one* artifact per scenario (unique name) -----------------
+      - name: Upload artifacts (${{ matrix.scenario }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jmeter-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            jmeter/results/${{ matrix.scenario }}/html
+            jmeter/results/${{ matrix.scenario }}.csv
+            jmeter/results/${{ matrix.scenario }}/jmeter.log
+            jmeter/results/${{ matrix.scenario }}/grafana
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
