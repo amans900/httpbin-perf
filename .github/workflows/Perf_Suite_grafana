@@ -1,4 +1,4 @@
-name: perf-suite
+name: perf_Suite_grafana
 
 on:
   push:
@@ -142,7 +142,7 @@ jobs:
 
           list_panels () {
             local uid="$1"
-            curl -fsSL ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${uid}" \
+            curl -fsSL ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/container-metrics/" \
               | jq -r '
                   .dashboard
                   | .. | objects
@@ -158,7 +158,7 @@ jobs:
             local base="$(echo "$title" | tr -cs '[:alnum:]_-' '_' | sed 's/_\+/_/g' | sed 's/^_//;s/_$//')"
             local file="${OUT_DIR}/${uid}_${pid}_${base}.png"
             curl -fsSL ${AUTH_FLAG} \
-              "${GRAFANA_URL}/render/d-solo/${uid}?orgId=1&panelId=${pid}&from=${FROM_MS}&to=${TO_MS}&width=1600&height=800&tz=UTC&theme=dark" \
+              "${GRAFANA_URL}/d/container-metrics/container-metrics-cadvisor?orgId=1&panelId=${pid}&from=${FROM_MS}&to=${TO_MS}&width=1600&height=800&tz=UTC&theme=dark" \
               -o "${file}" || true
             echo "Saved: ${file}"
           }
