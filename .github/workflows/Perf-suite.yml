@@ -13,75 +13,75 @@ env:
   # ---- Grafana ----
   GRAFANA_URL: http://localhost:3000
   GRAFANA_AUTH: admin:admin
-  # Your working dashboard URLs (exactly as you open them in the browser)
+
+  # Your working dashboard URLs (exactly as in the browser)
   GRAFANA_JMETER_URL: http://localhost:3000/d/JMeterOverview/jmeter-overview?orgId=1
-  GRAFANA_CAD_URL: http://localhost:3000/d/container-metrics/container-metrics-cadvisor?orgId=1
-  # Titles we use to resolve dashboards if UIDs are unknown
+  GRAFANA_CAD_URL:     http://localhost:3000/d/container-metrics/container-metrics-cadvisor?orgId=1
+
+  # Titles used when resolving by search if UIDs are unknown
   GRAFANA_JMETER_TITLE: JMeter Overview
-  GRAFANA_CAD_TITLE: Container Metrics (cAdvisor)
+  GRAFANA_CAD_TITLE:    Container Metrics (cAdvisor)
+
   # JMeter testplan (expects -Jthreads -Jrampup -Jduration)
   JMETER_JMX: testplans/httpbin_load.jmx
-  JMETER_IMAGE: justb4/jmeter:5.6.3
+
+  # Use a valid image tag (5.6 exists; 5.6.3 does NOT on Docker Hub)
+  JMETER_IMAGE: justb4/jmeter:5.6
 
 jobs:
   jmeter-matrix:
-    name: jmeter-matrix (${{ matrix.name }}, ${{ matrix.threads }}, ${{ matrix.rampup }}, ${{ matrix.duration }})
+    name: jmeter-matrix (${{ matrix.scen }}, ${{ matrix.threads }}, ${{ matrix.rampup }}, ${{ matrix.duration }})
     runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: "smoke, 50, 30, 60",  scen: smoke, threads: 50,  rampup: 30,  duration: 60  }
-          - { name: "load, 100, 60, 180", scen: load,  threads: 100, rampup: 60,  duration: 180 }
-          - { name: "stress, 300, 60, 120",scen: stress,threads: 300, rampup: 60,  duration: 120 }
-          - { name: "spike, 200, 10, 60", scen: spike, threads: 200, rampup: 10,  duration: 60  }
-          - { name: "soak, 50, 30, 900", scen: soak,  threads: 50,  rampup: 30,  duration: 900 }
+          # scen, threads, rampup, duration (seconds)
+          - { scen: smoke, threads: 50,  rampup: 30, duration: 60  }
+          - { scen: load,  threads: 100, rampup: 60, duration: 180 }
+          - { scen: stress,threads: 300, rampup: 60, duration: 120 }
+          - { scen: spike, threads: 200, rampup: 10, duration: 60  }
+          - { scen: soak,  threads: 50,  rampup: 30, duration: 900 }
 
     steps:
       - name: Set up job
         run: |
-          set -eux
-          sudo sysctl -w vm.max_map_count=262144 >/dev/null || true
-          echo "SCEN=${{ matrix.scen }}" >> "$GITHUB_ENV"
+          echo "JOB_START_MS=$(( $(date -u +%s) * 1000 ))" >> $GITHUB_ENV
+          echo "TZ=UTC" >> $GITHUB_ENV
 
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Mark job start (for Grafana time window)
-        run: |
-          set -eux
-          echo "JOB_START_MS=$(( $(date -u +%s) * 1000 ))" >> "$GITHUB_ENV"
+        run: echo "Start: ${JOB_START_MS}"
 
       - name: Start stack (httpbin + monitoring + grafana)
         run: |
-          set -eux
           docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
-          # Wait for Grafana to be ready
+          # wait for Grafana health
           for i in {1..60}; do
-            if curl -fsS "${GRAFANA_URL}/api/health" >/dev/null; then
-              echo "Grafana is up"
-              break
-            fi
+            if curl -fsS "${GRAFANA_URL}/api/health" >/dev/null; then break; fi
             sleep 2
           done
+          echo "Stack is up."
 
       - name: Install tools
         run: |
-          set -eux
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      - name: Build JMeter image (5.6.3)
+      - name: Build JMeter image (pull)
         run: |
           set -eux
           docker pull "${JMETER_IMAGE}"
 
-      - name: Run ${{ matrix.scen }} (headless; CSV JTL; generate HTML)
+      - name: Run ${ { matrix.scen } } (headless; CSV JTL; generate HTML)
         run: |
           set -eux
           mkdir -p jmeter/results/${{ matrix.scen }}/html
-          # Run JMeter
+
+          # Run JMeter headless
           docker run --rm --network host \
             -v "$PWD:/work" -w /work "${JMETER_IMAGE}" \
             -n -t "${JMETER_JMX}" \
@@ -91,7 +91,8 @@ jobs:
             -Jjmeter.save.saveservice.output_format=csv \
             -l "jmeter/results/${{ matrix.scen }}/results.jtl" \
             -j "jmeter/results/${{ matrix.scen }}/jmeter.log"
-          # Generate the dashboard HTML from CSV JTL
+
+          # Generate HTML dashboard from CSV JTL
           docker run --rm --network host \
             -v "$PWD:/work" -w /work "${JMETER_IMAGE}" \
             -g "jmeter/results/${{ matrix.scen }}/results.jtl" \
@@ -100,13 +101,14 @@ jobs:
       - name: Render Grafana panels (${{ matrix.scen }})
         env:
           SCEN: ${{ matrix.scen }}
+          FROM_MS: ${{ env.JOB_START_MS }}
         run: |
           set -eux
-
+          SCEN="${SCEN}"
           OUT_DIR="jmeter/results/${SCEN}/grafana"
           mkdir -p "${OUT_DIR}"
 
-          FROM_MS="${JOB_START_MS}"
+          FROM_MS="${FROM_MS}"
           TO_MS=$(( $(date -u +%s) * 1000 ))
           AUTH_FLAG="-u ${GRAFANA_AUTH}"
 
@@ -120,47 +122,16 @@ jobs:
             echo "$uid" "$slug" "$org"
           }
 
-          import_dash_if_present () {
-            local slug="$1"
-            for f in "grafana/dashboards/${slug}.json" "grafana/dashboards/${slug%%-*}.json"; do
-              if [ -f "$f" ]; then
-                echo "Importing $f"
-                payload=$(jq -c '{dashboard: ., overwrite: true}' "$f")
-                curl -fsS ${AUTH_FLAG} -H "Content-Type: application/json" \
-                  -X POST -d "$payload" "${GRAFANA_URL}/api/dashboards/db" >/dev/null || true
-                return 0
-              fi
-            done
-            return 1
-          }
-
           resolve_uid () {
             local want_uid="$1" want_slug="$2" want_title="$3"
             if curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${want_uid}" -o /tmp/d.json; then
-              local got_uid slug_api
-              got_uid="$(jq -r '.dashboard.uid' /tmp/d.json)"
-              slug_api="$(jq -r '.meta.slug // (.dashboard.slug // empty)' /tmp/d.json)"
-              [ -z "$slug_api" ] && slug_api="$(jq -r '.meta.url // ""' /tmp/d.json | awk -F/ '{print $NF}')"
-              rm -f /tmp/d.json
-              echo "$got_uid" "${slug_api:-$want_slug}"
-              return 0
+              echo "$(jq -r '.dashboard.uid' /tmp/d.json) $(jq -r '.meta.slug // (.dashboard.slug // empty)' /tmp/d.json)"
+              rm -f /tmp/d.json; return 0
             fi
             local res; res="$(curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/search?type=dash-db&limit=5000")"
             local uid url
-            uid="$(echo "$res" | jq -r '
-              map(select(
-                   (.uid=="'"$want_uid"'")
-                or (.url|endswith("/'"$want_slug"'"))
-                or (.title=="'"$want_title"'")
-                or (.slug=="'"$want_slug"'")
-              )) | .[0].uid // empty')"
-            url="$(echo "$res" | jq -r '
-              map(select(
-                   (.uid=="'"$want_uid"'")
-                or (.url|endswith("/'"$want_slug"'"))
-                or (.title=="'"$want_title"'")
-                or (.slug=="'"$want_slug"'")
-              )) | .[0].url // empty')"
+            uid="$(echo "$res" | jq -r 'map(select((.uid=="'"$want_uid"'") or (.url|endswith("/'"$want_slug"'")) or (.title=="'"$want_title"'") or (.slug=="'"$want_slug"'")))|.[0].uid // empty')"
+            url="$(echo "$res" | jq -r 'map(select((.uid=="'"$want_uid"'") or (.url|endswith("/'"$want_slug"'")) or (.title=="'"$want_title"'") or (.slug=="'"$want_slug"'")))|.[0].url // empty')"
             [ -z "$uid" ] && return 1
             echo "$uid" "${url##*/}"
           }
@@ -168,12 +139,7 @@ jobs:
           list_panels () {
             local uid="$1"
             curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${uid}" \
-              | jq -r '
-                  .dashboard
-                  | .. | objects
-                  | select(has("id") and has("title"))
-                  | select(.type != "row")
-                  | "\(.id)\t\(.title)"'
+              | jq -r '.dashboard|..|objects|select(has("id") and has("title"))|select(.type!="row")|"\(.id)\t\(.title)"'
           }
 
           render_panel () {
@@ -182,55 +148,49 @@ jobs:
             local out="${OUT_DIR}/${uid}_${pid}_${base}.png"
             local url1="${GRAFANA_URL}/render/d-solo/${uid}/${slug}?orgId=${org}&panelId=${pid}&from=${FROM_MS}&to=${TO_MS}&width=1600&height=800&tz=UTC&theme=dark"
             local url2="${GRAFANA_URL}/render/d-solo/${uid}?orgId=${org}&panelId=${pid}&from=${FROM_MS}&to=${TO_MS}&width=1600&height=800&tz=UTC&theme=dark"
-
             http1=$(curl -sS ${AUTH_FLAG} -w "%{http_code}" -o "${out}.tmp" "${url1}" || echo "000")
             if [ "$http1" != "200" ]; then
-              echo "Render 1 failed (${http1}) – trying without slug"
+              echo "Render 1 failed ($http1) – retry without slug"
               http2=$(curl -sS ${AUTH_FLAG} -w "%{http_code}" -o "${out}.tmp" "${url2}" || echo "000")
-              [ "$http2" != "200" ] && { echo "Render 2 failed (${http2})"; rm -f "${out}.tmp"; return 0; }
+              [ "$http2" != "200" ] && { echo "Render 2 failed ($http2)"; rm -f "${out}.tmp"; return 0; }
             fi
             mv "${out}.tmp" "${out}"
             echo "Saved ${out}"
           }
 
-          read JM_UID JM_SLUG JM_ORG < <(parse_uid_slug_org "$GRAFANA_JMETER_URL")
-          read CAD_UID CAD_SLUG CAD_ORG < <(parse_uid_slug_org "$GRAFANA_CAD_URL")
+          # Parse the dashboard URLs you use in the browser
+          read JM_UID JM_SLUG JM_ORG < <(parse_uid_slug_org "${GRAFANA_JMETER_URL}")
+          read CAD_UID CAD_SLUG CAD_ORG < <(parse_uid_slug_org "${GRAFANA_CAD_URL}")
 
           for rec in \
             "JM:${JM_UID}:${JM_SLUG}:${JM_ORG}:${GRAFANA_JMETER_TITLE}" \
             "CAD:${CAD_UID}:${CAD_SLUG}:${CAD_ORG}:${GRAFANA_CAD_TITLE}"
           do
             IFS=: read TAG WANT_UID WANT_SLUG ORG TITLE <<<"$rec"
-            echo "Prepare ${TAG} want uid=${WANT_UID} slug=${WANT_SLUG}"
-            # if dashboard isn’t there yet (fresh container), import local JSON (if exists)
-            import_dash_if_present "${WANT_SLUG}" || true
-
             if read -r REAL_UID REAL_SLUG < <(resolve_uid "${WANT_UID}" "${WANT_SLUG}" "${TITLE}"); then
-              echo "${TAG} resolved -> ${REAL_UID} / ${REAL_SLUG}"
+              echo "${TAG} -> ${REAL_UID}/${REAL_SLUG}"
               list_panels "${REAL_UID}" | while IFS=$'\t' read -r PID PTITLE; do
                 render_panel "${REAL_UID}" "${REAL_SLUG}" "${ORG}" "${PID}" "${PTITLE}"
               done
             else
-              echo "WARN: ${TAG} not found; skip rendering"
+              echo "WARN: ${TAG} dashboard not found; skipping"
             fi
           done
 
           ls -l "${OUT_DIR}" || true
 
       - name: Upload artifacts (${{ matrix.scen }})
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.scen }}-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: warn
-          retention-days: 14
+          name: results-${{ matrix.scen }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
+            jmeter/results/${{ matrix.scen }}/html
+            jmeter/results/${{ matrix.scen }}/grafana
             jmeter/results/${{ matrix.scen }}/jmeter.log
             jmeter/results/${{ matrix.scen }}/results.jtl
-            jmeter/results/${{ matrix.scen }}/html/**
-            jmeter/results/${{ matrix.scen }}/grafana/*.png
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Stop stack
         if: always()
-        run: |
-          docker compose -f docker-compose.yml -f docker-compose.override.yml down -v
+        run: docker compose -f docker-compose.yml -f docker-compose.override.yml down -v
