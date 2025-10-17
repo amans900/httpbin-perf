@@ -1,0 +1,25 @@
+services:
+  grafana:
+    environment:
+      # Make Grafana use the remote renderer sidecar
+      GF_RENDERING_SERVER_URL: http://renderer:8081/render
+      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+      GF_LOG_FILTERS: rendering:debug
+      # Optional: feature toggles are NOT required for rendering, but harmless if enabled
+      # GF_FEATURE_TOGGLES_ENABLE: "rendering"
+    depends_on:
+      - renderer
+
+  renderer:
+    image: grafana/grafana-image-renderer:3.12.6
+    container_name: renderer
+    restart: unless-stopped
+    environment:
+      ENABLE_METRICS: "true"
+      LOG_LEVEL: debug
+    # publish for CI fallback (curl to renderer directly if Grafana /render returns 500)
+    ports:
+      - "8081:8081"
+    # same network as grafana so "http://grafana:3000" works
+    networks:
+      - default
