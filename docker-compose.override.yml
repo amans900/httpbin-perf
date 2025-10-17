@@ -1,29 +1,23 @@
-version: "3.8"
-
 services:
   grafana:
-    # keep your existing image/volumes/ports; we only add config for image rendering
+    # Point Grafana at the renderer sidecar
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_INSTALL_PLUGINS=grafana-image-renderer
+      - GF_RENDERING_MODE=clustered
       - GF_RENDERING_SERVER_URL=http://renderer:8081/render
       - GF_RENDERING_CALLBACK_URL=http://grafana:3000/
       - GF_LOG_FILTERS=rendering:debug
+      - GF_DATE_FORMATS_DEFAULT_TIMEZONE=UTC
     depends_on:
       - renderer
 
+  # Headless Chromium renderer for PNG export
   renderer:
-    image: grafana/grafana-image-renderer:3.9.0
+    image: grafana/grafana-image-renderer:3.11.0
     restart: unless-stopped
+    shm_size: 1g
     environment:
-      # headless chromium tuning for CI
       - ENABLE_METRICS=true
-      - RENDERING_MODE=clustered
-      - LOG_LEVEL=debug
-      - HTTP_PORT=8081
+      - RENDERING_VERBOSE_LOGGING=true
       - IGNORE_HTTPS_ERRORS=true
-      - TZ=UTC
-    # no ports exposed; grafana calls this internally on the docker network
-    networks:
-      - default
+      - CHROME_ARGS=--no-sandbox,--disable-dev-shm-usage
+    # no ports: Grafana talks to it over the compose network
