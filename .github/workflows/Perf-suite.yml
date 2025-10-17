@@ -1,31 +1,72 @@
-services:
-  grafana:
-    image: grafana/grafana:10.4.3
-    container_name: grafana
-    ports:
-      - "3000:3000"
-    environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_SERVER_ROOT_URL: http://localhost:3000/
-      # >>> crucial: wire renderer
-      GF_RENDERING_SERVER_URL: http://renderer:8081/render
-      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
-      GF_RENDERING_CONCURRENT_RENDER_REQUEST_LIMIT: "4"
-      GF_LOG_FILTERS: rendering:debug
-    depends_on:
-      - renderer
-    volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
-    restart: unless-stopped
+name: perf-suite
 
-  renderer:
-    image: grafana/grafana-image-renderer:3.6.1
-    container_name: renderer
-    # No host port needed; Grafana talks to it via the compose network
-    environment:
-      ENABLE_METRICS: "true"
-      LOG_LEVEL: debug
-      RENDERING_MODE: clustered
-    restart: unless-stopped
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  jmeter-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: smoke
+            threads: 50
+            rampup: 30
+            duration: 60
+          - scenario: load
+            threads: 100
+            rampup: 60
+            duration: 180
+          - scenario: stress
+            threads: 300
+            rampup: 60
+            duration: 120
+          - scenario: spike
+            threads: 200
+            rampup: 10
+            duration: 60
+          - scenario: soak
+            threads: 50
+            rampup: 30
+            duration: 900
+
+    env:
+      # Grafana reachable from the runner (compose publishes :3000)
+      GRAFANA_URL: http://localhost:3000
+
+      # Use the same links you open in the browser; orgId will be parsed.
+      GRAFANA_JMETER_URL: http://localhost:3000/d/JMeterOverview/jmeter-overview?orgId=1
+      GRAFANA_CAD_URL:    http://localhost:3000/d/container-metrics/container-metrics-cadvisor?orgId=1
+
+      # Titles (used as a fallback match during UID resolution)
+      GRAFANA_JMETER_TITLE: JMeter Overview
+      GRAFANA_CAD_TITLE:    Container Metrics (cAdvisor)
+
+      # Grafana auth for API/render
+      GRAFANA_AUTH: admin:admin
+      GRAFANA_ORGID_DEFAULT: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mark job start (for Grafana time window)
+        run: echo "JOB_START_MS=$(( $(date -u +%s) * 1000 ))" >> "$GITHUB_ENV"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Start stack (httpbin + monitoring + grafana)
+        run: |
+          set -eux
+          docker compose up -d
+          # Wait for Grafana API
+          for i in {1..60}; do
+            curl -fsS "${GRAFANA_URL}/api/health" >/dev/null && break || sleep 2
+          done
+          # Optional: check renderer wiring (200 means renderer is wired)
