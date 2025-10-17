@@ -129,33 +129,65 @@ jobs:
           TO_MS=$(( $(date -u +%s) * 1000 ))
           AUTH_FLAG="-u ${GRAFANA_AUTH}"
 
-          # -------- helpers ----------
-          # Parse UID, slug, orgId from a /d/<uid>/<slug>?orgId=N URL
+          # ---------- helpers ----------
+          # Parse: /d/<uid>/<slug>?orgId=N  ->  uid slug orgId
           parse_uid_slug_org () {
             local url="$1"
             local rest="${url#*/d/}"               # <uid>/<slug>?...
             local path="${rest%%\?*}"              # <uid>/<slug>
-            local uid="${path%%/*}"                # uid
-            local slug="${path#*/}"                # slug
-            local q="${rest#*\?}"                  # query-part
+            local uid="${path%%/*}"
+            local slug="${path#*/}"
+            local q="${rest#*\?}"
             local org="$(echo "$q" | sed -n -E 's/.*(^|&)orgId=([^&]+).*/\2/p')"
             [ -z "$org" ] && org="${GRAFANA_ORGID_DEFAULT}"
             echo "$uid" "$slug" "$org"
           }
 
-          # Resolve UID robustly:
-          # 1) try /api/dashboards/uid/<uidFromUrl>
-          # 2) fallback to /api/search?type=dash-db&limit=5000 and match by uid OR slug OR exact title
+          wait_grafana () {
+            for i in {1..60}; do
+              curl -fsS "${GRAFANA_URL}/api/health" >/dev/null && return 0 || sleep 2
+            done
+            echo "ERROR: Grafana API not ready" >&2; return 1
+          }
+
+          # Wait for a dashboard UID to exist (provisioning can lag)
+          wait_dash_by_uid () {
+            local uid="$1"
+            for i in {1..60}; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${uid}")
+              [ "$code" = "200" ] && return 0
+              sleep 2
+            done
+            return 1
+          }
+
+          # Try to import a dashboard JSON if it exists locally
+          import_dash_if_present () {
+            local slug="$1"
+            # try common locations/names
+            for f in "grafana/dashboards/${slug}.json" "grafana/dashboards/${slug%%-*}.json"; do
+              if [ -f "$f" ]; then
+                echo "Importing dashboard from $f"
+                payload=$(jq -c '{dashboard: ., overwrite: true}' "$f")
+                curl -fsS ${AUTH_FLAG} -H "Content-Type: application/json" \
+                  -X POST -d "$payload" "${GRAFANA_URL}/api/dashboards/db" >/dev/null || true
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          # Resolve the current UID in this Grafana:
+          # 1) try direct UID; if 404, 2) full search and match by uid OR slug OR exact title
           resolve_uid () {
             local want_uid="$1" want_slug="$2" want_title="$3"
-            local tmp=/tmp/dash.json
-            if curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${want_uid}" -o "${tmp}"; then
+            if curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${want_uid}" -o /tmp/d.json; then
               local got_uid slug_api
-              got_uid="$(jq -r '.dashboard.uid' "${tmp}")"
-              slug_api="$(jq -r '.meta.slug // (.dashboard.slug // empty)' "${tmp}")"
-              [ -z "$slug_api" ] && slug_api="$(jq -r '.meta.url // ""' "${tmp}" | awk -F/ '{print $NF}')"
+              got_uid="$(jq -r '.dashboard.uid' /tmp/d.json)"
+              slug_api="$(jq -r '.meta.slug // (.dashboard.slug // empty)' /tmp/d.json)"
+              [ -z "$slug_api" ] && slug_api="$(jq -r '.meta.url // ""' /tmp/d.json | awk -F/ '{print $NF}')"
+              rm -f /tmp/d.json
               echo "$got_uid" "${slug_api:-$want_slug}"
-              rm -f "${tmp}"
               return 0
             fi
             local res; res="$(curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/search?type=dash-db&limit=5000")"
@@ -180,7 +212,7 @@ jobs:
 
           list_panels () {
             local uid="$1"
-            curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${uid}" \
+            curl -fsSL ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${uid}" \
               | jq -r '
                   .dashboard
                   | .. | objects
@@ -193,40 +225,46 @@ jobs:
             local uid="$1" slug="$2" org="$3" pid="$4" title="$5"
             local base="$(echo "$title" | tr -cs '[:alnum:]_-' '_' | sed 's/_\+/_/g;s/^_//;s/_$//')"
             local out="${OUT_DIR}/${uid}_${pid}_${base}.png"
-            curl -fsSL ${AUTH_FLAG} \
+            # try with slug; if that 404s (older Grafana accepts no slug), retry without slug
+            curl -fsS ${AUTH_FLAG} \
               "${GRAFANA_URL}/render/d-solo/${uid}/${slug}?orgId=${org}&panelId=${pid}&from=${FROM_MS}&to=${TO_MS}&width=1600&height=800&tz=UTC&theme=dark" \
+              -o "${out}" || curl -fsS ${AUTH_FLAG} \
+              "${GRAFANA_URL}/render/d-solo/${uid}?orgId=${org}&panelId=${pid}&from=${FROM_MS}&to=${TO_MS}&width=1600&height=800&tz=UTC&theme=dark" \
               -o "${out}" || true
             echo "Saved: ${out}"
           }
+          # ---------- /helpers ----------
 
-          # -------- resolve and render ----------
-          read JM_UID_URL JM_SLUG_URL JM_ORGID  < <(parse_uid_slug_org "$GRAFANA_JMETER_URL")
+          wait_grafana
+
+          # parse your URLs
+          read JM_UID_URL JM_SLUG_URL JM_ORGID   < <(parse_uid_slug_org "$GRAFANA_JMETER_URL")
           read CAD_UID_URL CAD_SLUG_URL CAD_ORGID < <(parse_uid_slug_org "$GRAFANA_CAD_URL")
 
-          read JM_UID JM_SLUG_R   < <(resolve_uid "$JM_UID_URL"  "$JM_SLUG_URL"  "${GRAFANA_JMETER_TITLE}") || true
-          read CAD_UID CAD_SLUG_R < <(resolve_uid "$CAD_UID_URL" "$CAD_SLUG_URL" "${GRAFANA_CAD_TITLE}")   || true
-
-          [ -z "$JM_SLUG_R" ] && JM_SLUG_R="$JM_SLUG_URL"
-          [ -z "$CAD_SLUG_R" ] && CAD_SLUG_R="$CAD_SLUG_URL"
-
-          echo "Resolved:"
-          echo "  JMeterOverview -> uid=${JM_UID:-<not found>} slug=${JM_SLUG_R} orgId=${JM_ORGID}"
-          echo "  cAdvisor       -> uid=${CAD_UID:-<not found>} slug=${CAD_SLUG_R} orgId=${CAD_ORGID}"
-
-          for rec in "JM:${JM_UID}:${JM_SLUG_R}:${JM_ORGID}" "CAD:${CAD_UID}:${CAD_SLUG_R}:${CAD_ORGID}"; do
-            IFS=: read tag DUID DSLUG DORGID <<<"${rec}"
-            if [ -z "$DUID" ]; then
-              echo "skip ${tag}: uid not resolved"
+          # if direct UID not ready, try import (if JSON exists), then wait/resolve
+          for rec in "JM:${JM_UID_URL}:${JM_SLUG_URL}:${JM_ORGID}:JMeter Overview" \
+                     "CAD:${CAD_UID_URL}:${CAD_SLUG_URL}:${CAD_ORGID}:Container Metrics (cAdvisor)"; do
+            IFS=: read TAG WANT_UID WANT_SLUG ORG TITLE <<<"$rec"
+            echo "Preparing ${TAG} (wanted uid=${WANT_UID}, slug=${WANT_SLUG})"
+            if ! wait_dash_by_uid "${WANT_UID}"; then
+              import_dash_if_present "${WANT_SLUG}" || true
+            fi
+            # resolve the actual UID+slug that exist *now* in this Grafana
+            if read -r REAL_UID REAL_SLUG < <(resolve_uid "${WANT_UID}" "${WANT_SLUG}" "${TITLE}"); then
+              echo "${TAG}: resolved uid=${REAL_UID}, slug=${REAL_SLUG}"
+            else
+              echo "WARN: ${TAG} dashboard not found; skipping"
               continue
             fi
-            echo "Rendering ${tag} (uid=${DUID}, slug=${DSLUG})..."
-            list_panels "${DUID}" | while IFS=$'\t' read -r pid ptitle; do
-              echo "  panelId=${pid} title=${ptitle}"
-              render_panel "${DUID}" "${DSLUG}" "${DORGID}" "${pid}" "${ptitle}"
+            echo "Rendering ${TAG} panels..."
+            list_panels "${REAL_UID}" | while IFS=$'\t' read -r PID PTITLE; do
+              echo "  panelId=${PID}  title=${PTITLE}"
+              render_panel "${REAL_UID}" "${REAL_SLUG}" "${ORG}" "${PID}" "${PTITLE}"
             done
           done
 
           ls -l "${OUT_DIR}" || true
+
 
       - name: Upload artifacts (${{ matrix.scenario }})
         if: always()
