@@ -1,0 +1,16 @@
+services:
+  grafana:
+    environment:
+      - GF_PANELS_ENABLE_IMAGE_EXPORT=true
+      - GF_RENDERING_SERVER_URL=http://renderer:8081/render
+      - GF_RENDERING_CALLBACK_URL=http://grafana:3000/
+      - GF_LOG_FILTERS=rendering:debug
+    # Note: the service name ("grafana") must match the one in your base compose.
+
+  renderer:
+    image: grafana/grafana-image-renderer:3.10.2
+    environment:
+      - ENABLE_METRICS=true
+      - RENDERING_MODE=clustered
+    depends_on:
+      - grafana
