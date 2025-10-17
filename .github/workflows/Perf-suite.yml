@@ -34,11 +34,16 @@ jobs:
             duration: 900
 
     env:
-      # Where Grafana is reachable from the runner (Docker publishes 3000 to host)
+      # Grafana endpoint exposed by docker compose
       GRAFANA_URL: http://localhost:3000
-      # Use the same dashboard URLs you use in the browser (we will resolve UID by slug)
+      # Use the exact URLs you use locally;
+      # we will extract uid/slug/orgId and resolve safely inside CI.
       GRAFANA_JMETER_URL: http://localhost:3000/d/JMeterOverview/jmeter-overview?orgId=1
       GRAFANA_CAD_URL:    http://localhost:3000/d/container-metrics/container-metrics-cadvisor?orgId=1
+      # Titles used as a last-resort match in search:
+      GRAFANA_JMETER_TITLE: JMeter Overview
+      GRAFANA_CAD_TITLE:    Container Metrics (cAdvisor)
+
       GRAFANA_AUTH: admin:admin
       GRAFANA_ORGID_DEFAULT: "1"
 
@@ -50,7 +55,7 @@ jobs:
         run: |
           set -eux
           docker compose up -d influxdb httpbin grafana renderer loki promtail prometheus cadvisor
-          # Wait for Grafana to be ready
+          # Wait until Grafana is healthy
           for i in {1..60}; do
             curl -fsS "${GRAFANA_URL}/api/health" >/dev/null && break || sleep 2
           done
@@ -73,7 +78,6 @@ jobs:
           START_MS=$(( $(date -u +%s) * 1000 ))
           echo "start_ms=${START_MS}" >> "$GITHUB_OUTPUT"
 
-          # Run headless + write CSV JTL + generate HTML
           set +e
           docker run --rm --network host \
             -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
@@ -125,38 +129,55 @@ jobs:
           TO_MS=$(( $(date -u +%s) * 1000 ))
           AUTH_FLAG="-u ${GRAFANA_AUTH}"
 
-          # ---------- helpers ----------
-          # Parse (slug, orgId) from /d/<uid>/<slug>?orgId=N; ignore the uid in URL
-          parse_slug_org () {
+          # -------- helpers ----------
+          # Parse UID, slug, orgId from a /d/<uid>/<slug>?orgId=N URL
+          parse_uid_slug_org () {
             local url="$1"
-            local rest="${url#*/d/}"
-            local path="${rest%%\?*}"
-            local slug="${path#*/}"
-            local q="${rest#*\?}"
+            local rest="${url#*/d/}"               # <uid>/<slug>?...
+            local path="${rest%%\?*}"              # <uid>/<slug>
+            local uid="${path%%/*}"                # uid
+            local slug="${path#*/}"                # slug
+            local q="${rest#*\?}"                  # query-part
             local org="$(echo "$q" | sed -n -E 's/.*(^|&)orgId=([^&]+).*/\2/p')"
             [ -z "$org" ] && org="${GRAFANA_ORGID_DEFAULT}"
-            echo "$slug" "$org"
+            echo "$uid" "$slug" "$org"
           }
 
-          # Resolve UID by slug using /api/search
-          resolve_uid_by_slug () {
-            local slug="$1"
-            local res
-            res="$(curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/search?type=dash-db&query=${slug}")"
-            local uid url
-            uid="$(echo "$res" | jq -r \
-              'map(select((.url|endswith("/'"$slug"'")) or (.slug=="'"$slug"'"))) | .[0].uid // empty')"
-            url="$(echo "$res" | jq -r \
-              'map(select((.url|endswith("/'"$slug"'")) or (.slug=="'"$slug"'"))) | .[0].url // empty')"
-            if [ -z "$uid" ]; then
-              echo "ERROR: Could not resolve UID for slug '${slug}'" >&2
-              echo ""
-              return 1
+          # Resolve UID robustly:
+          # 1) try /api/dashboards/uid/<uidFromUrl>
+          # 2) fallback to /api/search?type=dash-db&limit=5000 and match by uid OR slug OR exact title
+          resolve_uid () {
+            local want_uid="$1" want_slug="$2" want_title="$3"
+            local tmp=/tmp/dash.json
+            if curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${want_uid}" -o "${tmp}"; then
+              local got_uid slug_api
+              got_uid="$(jq -r '.dashboard.uid' "${tmp}")"
+              slug_api="$(jq -r '.meta.slug // (.dashboard.slug // empty)' "${tmp}")"
+              [ -z "$slug_api" ] && slug_api="$(jq -r '.meta.url // ""' "${tmp}" | awk -F/ '{print $NF}')"
+              echo "$got_uid" "${slug_api:-$want_slug}"
+              rm -f "${tmp}"
+              return 0
             fi
+            local res; res="$(curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/search?type=dash-db&limit=5000")"
+            local uid url
+            uid="$(echo "$res" | jq -r '
+              map(select(
+                   (.uid=="'"$want_uid"'")
+                or (.url|endswith("/'"$want_slug"'"))
+                or (.title=="'"$want_title"'")
+                or (.slug=="'"$want_slug"'")
+              )) | .[0].uid // empty')"
+            url="$(echo "$res" | jq -r '
+              map(select(
+                   (.uid=="'"$want_uid"'")
+                or (.url|endswith("/'"$want_slug"'"))
+                or (.title=="'"$want_title"'")
+                or (.slug=="'"$want_slug"'")
+              )) | .[0].url // empty')"
+            [ -z "$uid" ] && return 1
             echo "$uid" "${url##*/}"
           }
 
-          # List non-row panels
           list_panels () {
             local uid="$1"
             curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${uid}" \
@@ -178,22 +199,26 @@ jobs:
             echo "Saved: ${out}"
           }
 
-          # ---------- resolve and render ----------
-          read JM_SLUG JM_ORGID  < <(parse_slug_org "$GRAFANA_JMETER_URL")
-          read CAD_SLUG CAD_ORGID < <(parse_slug_org "$GRAFANA_CAD_URL")
+          # -------- resolve and render ----------
+          read JM_UID_URL JM_SLUG_URL JM_ORGID  < <(parse_uid_slug_org "$GRAFANA_JMETER_URL")
+          read CAD_UID_URL CAD_SLUG_URL CAD_ORGID < <(parse_uid_slug_org "$GRAFANA_CAD_URL")
 
-          read JM_UID JM_SLUG_R   < <(resolve_uid_by_slug "$JM_SLUG")
-          read CAD_UID CAD_SLUG_R < <(resolve_uid_by_slug "$CAD_SLUG")
-          [ -z "$JM_SLUG_R" ] && JM_SLUG_R="$JM_SLUG"
-          [ -z "$CAD_SLUG_R" ] && CAD_SLUG_R="$CAD_SLUG"
+          read JM_UID JM_SLUG_R   < <(resolve_uid "$JM_UID_URL"  "$JM_SLUG_URL"  "${GRAFANA_JMETER_TITLE}") || true
+          read CAD_UID CAD_SLUG_R < <(resolve_uid "$CAD_UID_URL" "$CAD_SLUG_URL" "${GRAFANA_CAD_TITLE}")   || true
+
+          [ -z "$JM_SLUG_R" ] && JM_SLUG_R="$JM_SLUG_URL"
+          [ -z "$CAD_SLUG_R" ] && CAD_SLUG_R="$CAD_SLUG_URL"
 
           echo "Resolved:"
-          echo "  JMeterOverview -> uid=${JM_UID} slug=${JM_SLUG_R} orgId=${JM_ORGID}"
-          echo "  cAdvisor       -> uid=${CAD_UID} slug=${CAD_SLUG_R} orgId=${CAD_ORGID}"
+          echo "  JMeterOverview -> uid=${JM_UID:-<not found>} slug=${JM_SLUG_R} orgId=${JM_ORGID}"
+          echo "  cAdvisor       -> uid=${CAD_UID:-<not found>} slug=${CAD_SLUG_R} orgId=${CAD_ORGID}"
 
           for rec in "JM:${JM_UID}:${JM_SLUG_R}:${JM_ORGID}" "CAD:${CAD_UID}:${CAD_SLUG_R}:${CAD_ORGID}"; do
             IFS=: read tag DUID DSLUG DORGID <<<"${rec}"
-            [ -z "$DUID" ] && { echo "skip ${tag}: uid not resolved"; continue; }
+            if [ -z "$DUID" ]; then
+              echo "skip ${tag}: uid not resolved"
+              continue
+            fi
             echo "Rendering ${tag} (uid=${DUID}, slug=${DSLUG})..."
             list_panels "${DUID}" | while IFS=$'\t' read -r pid ptitle; do
               echo "  panelId=${pid} title=${ptitle}"
