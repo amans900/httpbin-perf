@@ -34,14 +34,12 @@ jobs:
             duration: 900
 
     env:
-      # Base Grafana URL
+      # Where Grafana is reachable from the runner (Docker publishes 3000 to host)
       GRAFANA_URL: http://localhost:3000
-      # Use your working URLs (UID/slug will be parsed from these)
+      # Use the same dashboard URLs you use in the browser (we will resolve UID by slug)
       GRAFANA_JMETER_URL: http://localhost:3000/d/JMeterOverview/jmeter-overview?orgId=1
       GRAFANA_CAD_URL:    http://localhost:3000/d/container-metrics/container-metrics-cadvisor?orgId=1
-      # Basic auth used by render/API (match docker-compose env)
       GRAFANA_AUTH: admin:admin
-      # Default orgId if not present in dashboard URL
       GRAFANA_ORGID_DEFAULT: "1"
 
     steps:
@@ -52,7 +50,7 @@ jobs:
         run: |
           set -eux
           docker compose up -d influxdb httpbin grafana renderer loki promtail prometheus cadvisor
-          # wait for grafana
+          # Wait for Grafana to be ready
           for i in {1..60}; do
             curl -fsS "${GRAFANA_URL}/api/health" >/dev/null && break || sleep 2
           done
@@ -60,7 +58,6 @@ jobs:
       - name: Build JMeter image (5.6.3)
         run: docker build -t jmeter:5.6.3 ./jmeter/docker
 
-      # -------- Run test & produce CSV + HTML --------
       - name: Run ${{ matrix.scenario }} (CSV JTL + HTML report)
         id: run_test
         run: |
@@ -69,15 +66,14 @@ jobs:
           ROOT=jmeter/results
           OUT="$ROOT/$SCEN"
           CSV_JTL="$ROOT/${SCEN}.csv"
-
           mkdir -p "$OUT"
           rm -f "$CSV_JTL" || true
           rm -rf "$OUT/html" || true
 
-          # record precise start time (ms)
           START_MS=$(( $(date -u +%s) * 1000 ))
           echo "start_ms=${START_MS}" >> "$GITHUB_OUTPUT"
 
+          # Run headless + write CSV JTL + generate HTML
           set +e
           docker run --rm --network host \
             -e JVM_ARGS="-Djava.awt.headless=true -Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m" \
@@ -117,7 +113,6 @@ jobs:
           head -n 1 "$CSV_JTL" || true
           test -f "$OUT/html/index.html" && echo "HTML OK" || echo "HTML MISSING"
 
-      # -------- Render Grafana PNGs from exact start→end window --------
       - name: Render Grafana panels (${{ matrix.scenario }})
         if: always()
         run: |
@@ -128,34 +123,43 @@ jobs:
 
           FROM_MS="${{ steps.run_test.outputs.start_ms }}"
           TO_MS=$(( $(date -u +%s) * 1000 ))
-
           AUTH_FLAG="-u ${GRAFANA_AUTH}"
 
-          # helper: parse UID, slug, and (optional) orgId from a /d/<uid>/<slug>?orgId=N URL
-          parse_uid_slug () {
+          # ---------- helpers ----------
+          # Parse (slug, orgId) from /d/<uid>/<slug>?orgId=N; ignore the uid in URL
+          parse_slug_org () {
             local url="$1"
-            # strip protocol+host up to /d/
-            local rest="$(echo "$url" | sed -E 's#^https?://[^/]+/d/##')"
+            local rest="${url#*/d/}"
             local path="${rest%%\?*}"
-            local q="${rest#*\?}"
-            local uid="${path%%/*}"
             local slug="${path#*/}"
-            # orgId from query if present
+            local q="${rest#*\?}"
             local org="$(echo "$q" | sed -n -E 's/.*(^|&)orgId=([^&]+).*/\2/p')"
-            if [ -z "$org" ]; then org="${GRAFANA_ORGID_DEFAULT}"; fi
-            echo "$uid" "$slug" "$org"
+            [ -z "$org" ] && org="${GRAFANA_ORGID_DEFAULT}"
+            echo "$slug" "$org"
           }
 
-          read JM_UID JM_SLUG JM_ORGID < <(parse_uid_slug "$GRAFANA_JMETER_URL")
-          read CAD_UID CAD_SLUG CAD_ORGID < <(parse_uid_slug "$GRAFANA_CAD_URL")
+          # Resolve UID by slug using /api/search
+          resolve_uid_by_slug () {
+            local slug="$1"
+            local res
+            res="$(curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/search?type=dash-db&query=${slug}")"
+            local uid url
+            uid="$(echo "$res" | jq -r \
+              'map(select((.url|endswith("/'"$slug"'")) or (.slug=="'"$slug"'"))) | .[0].uid // empty')"
+            url="$(echo "$res" | jq -r \
+              'map(select((.url|endswith("/'"$slug"'")) or (.slug=="'"$slug"'"))) | .[0].url // empty')"
+            if [ -z "$uid" ]; then
+              echo "ERROR: Could not resolve UID for slug '${slug}'" >&2
+              echo ""
+              return 1
+            fi
+            echo "$uid" "${url##*/}"
+          }
 
-          echo "JMeterOverview -> uid=${JM_UID} slug=${JM_SLUG} orgId=${JM_ORGID}"
-          echo "cAdvisor      -> uid=${CAD_UID} slug=${CAD_SLUG} orgId=${CAD_ORGID}"
-
-          # list all leaf panels (skip 'row' groups)
+          # List non-row panels
           list_panels () {
             local uid="$1"
-            curl -fsSL ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${uid}" \
+            curl -fsS ${AUTH_FLAG} "${GRAFANA_URL}/api/dashboards/uid/${uid}" \
               | jq -r '
                   .dashboard
                   | .. | objects
@@ -164,7 +168,6 @@ jobs:
                   | "\(.id)\t\(.title)"'
           }
 
-          # render single panel via /render/d-solo/<uid>/<slug>
           render_panel () {
             local uid="$1" slug="$2" org="$3" pid="$4" title="$5"
             local base="$(echo "$title" | tr -cs '[:alnum:]_-' '_' | sed 's/_\+/_/g;s/^_//;s/_$//')"
@@ -175,12 +178,25 @@ jobs:
             echo "Saved: ${out}"
           }
 
-          # iterate dashboards you asked for
-          for rec in "JM:${JM_UID}:${JM_SLUG}:${JM_ORGID}" "CAD:${CAD_UID}:${CAD_SLUG}:${CAD_ORGID}"; do
+          # ---------- resolve and render ----------
+          read JM_SLUG JM_ORGID  < <(parse_slug_org "$GRAFANA_JMETER_URL")
+          read CAD_SLUG CAD_ORGID < <(parse_slug_org "$GRAFANA_CAD_URL")
+
+          read JM_UID JM_SLUG_R   < <(resolve_uid_by_slug "$JM_SLUG")
+          read CAD_UID CAD_SLUG_R < <(resolve_uid_by_slug "$CAD_SLUG")
+          [ -z "$JM_SLUG_R" ] && JM_SLUG_R="$JM_SLUG"
+          [ -z "$CAD_SLUG_R" ] && CAD_SLUG_R="$CAD_SLUG"
+
+          echo "Resolved:"
+          echo "  JMeterOverview -> uid=${JM_UID} slug=${JM_SLUG_R} orgId=${JM_ORGID}"
+          echo "  cAdvisor       -> uid=${CAD_UID} slug=${CAD_SLUG_R} orgId=${CAD_ORGID}"
+
+          for rec in "JM:${JM_UID}:${JM_SLUG_R}:${JM_ORGID}" "CAD:${CAD_UID}:${CAD_SLUG_R}:${CAD_ORGID}"; do
             IFS=: read tag DUID DSLUG DORGID <<<"${rec}"
-            echo "Rendering ${tag} dashboard (uid=${DUID} slug=${DSLUG})..."
+            [ -z "$DUID" ] && { echo "skip ${tag}: uid not resolved"; continue; }
+            echo "Rendering ${tag} (uid=${DUID}, slug=${DSLUG})..."
             list_panels "${DUID}" | while IFS=$'\t' read -r pid ptitle; do
-              echo "  panelId=${pid}  title=${ptitle}"
+              echo "  panelId=${pid} title=${ptitle}"
               render_panel "${DUID}" "${DSLUG}" "${DORGID}" "${pid}" "${ptitle}"
             done
           done
@@ -191,7 +207,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jmeter-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: perf-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 30
           if-no-files-found: warn
           path: |
